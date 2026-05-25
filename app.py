@@ -19,11 +19,11 @@ st.set_page_config(page_title="Extractor de Seguros IA", page_icon="🌐", layou
 st.title("🌐 Extractor de Seguros - Nube Auto-Sincronizada")
 st.markdown("Procesamiento de pólizas con historial guardado automáticamente en tu Google Drive.")
 
-# 1. CONFIGURACIÓN DE SEGURIDAD (CON TUS NUEVOS NOMBRES DE SECRETS)
-if "GEMINI_API_KEY" in st.secrets and "GCP_SERVICE_ACCOUNT" in st.secrets:
+# 1. CONFIGURACIÓN DE SEGURIDAD
+if "GEMINI_API_KEY" in st.secrets and "GCP_SERVICE_ACCOUNT" in st.secrets and "DRIVE_FOLDER_ID" in st.secrets:
     genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
 else:
-    st.error("🔑 Falta configurar las llaves 'GEMINI_API_KEY' o 'GCP_SERVICE_ACCOUNT' en los secretos de Streamlit.")
+    st.error("🔑 Falta configurar las llaves o el 'DRIVE_FOLDER_ID' en los secretos de Streamlit.")
     st.stop()
 
 # Inicializar memoria de la sesión actual
@@ -31,10 +31,10 @@ if "archivos_listos" not in st.session_state:
     st.session_state.archivos_listos = {}
 
 NOMBRE_ARCHIVO_DRIVE = "registro_procesados.json"
+FOLDER_ID = st.secrets["DRIVE_FOLDER_ID"] # ID de tu carpeta personal
 
 # Conectar de forma segura usando tu bloque JSON de Secrets
 def obtener_servicio_drive():
-    # AJUSTE CLAVE: Convierte el bloque de texto plano de tu Secret en un JSON real para Python
     info_claves = json.loads(st.secrets["GCP_SERVICE_ACCOUNT"])
     credenciales = service_account.Credentials.from_service_account_info(
         info_claves, 
@@ -42,12 +42,13 @@ def obtener_servicio_drive():
     )
     return build('drive', 'v3', credentials=credenciales)
 
-# DESCARGA AUTOMÁTICA DESDE TU DRIVE
+# DESCARGA AUTOMÁTICA DESDE TU CARPETA DE DRIVE
 def cargar_log_desde_drive():
     try:
         drive_service = obtener_servicio_drive()
+        # MODIFICACIÓN: Buscar solo dentro de la carpeta compartida especificada
         resultado = drive_service.files().list(
-            q=f"name='{NOMBRE_ARCHIVO_DRIVE}' and trashed=false",
+            q=f"name='{NOMBRE_ARCHIVO_DRIVE}' and '{FOLDER_ID}' in parents and trashed=false",
             fields="files(id)",
             pageSize=1
         ).execute()
@@ -70,7 +71,7 @@ def cargar_log_desde_drive():
         st.warning(f"⚠️ No se pudo descargar el historial de Google Drive (Se iniciará uno nuevo): {e}")
         return {}, None
 
-# SUBIDA AUTOMÁTICA A TU DRIVE
+# SUBIDA AUTOMÁTICA A TU CARPETA DE DRIVE
 def guardar_log_en_drive(log_actualizado, file_id):
     try:
         drive_service = obtener_servicio_drive()
@@ -78,9 +79,14 @@ def guardar_log_en_drive(log_actualizado, file_id):
         media = MediaInMemoryUpload(contenido_json, mimetype='application/json', resumable=True)
         
         if file_id:
+            # Actualizar archivo existente
             drive_service.files().update(fileId=file_id, media_body=media).execute()
         else:
-            meta_archivo = {'name': NOMBRE_ARCHIVO_DRIVE}
+            # MODIFICACIÓN: Forzar a que se cree DENTRO de tu carpeta compartida de Drive
+            meta_archivo = {
+                'name': NOMBRE_ARCHIVO_DRIVE,
+                'parents': [FOLDER_ID]
+            }
             drive_service.files().create(body=meta_archivo, media_body=media, fields='id').execute()
     except Exception as e:
         st.error(f"❌ Error al salvar el historial en Google Drive: {e}")
@@ -174,7 +180,6 @@ if archivos_cargados:
                     f_fin = corregir_formato_fecha(datos.fecha_fin)
                     tipo_doc = datos.tipo_documento.lower().strip()
                     
-                    # Corrección para empresas (RNC -> póliza)
                     if "rnc" in tipo_doc:
                         tipo_doc = "póliza"
                     
