@@ -45,6 +45,7 @@ def obtener_servicio_drive():
 def cargar_log_desde_drive():
     try:
         drive_service = obtener_servicio_drive()
+        # Buscar si el archivo ya existe en tu Drive
         resultado = drive_service.files().list(
             q=f"name='{NOMBRE_ARCHIVO_DRIVE}' and trashed=false",
             fields="files(id)",
@@ -53,7 +54,7 @@ def cargar_log_desde_drive():
         
         archivos = resultado.get('files', [])
         if not archivos:
-            return {}, None
+            return {}, None # No existe todavía, se creará uno nuevo
             
         file_id = archivos[0]['id']
         peticion = drive_service.files().get_media(fileId=file_id)
@@ -77,8 +78,10 @@ def guardar_log_en_drive(log_actualizado, file_id):
         media = MediaInMemoryUpload(contenido_json, mimetype='application/json', resumable=True)
         
         if file_id:
+            # Si el archivo ya existía, lo sobrescribe con los nuevos datos
             drive_service.files().update(fileId=file_id, media_body=media).execute()
         else:
+            # Si es la primera vez, crea el archivo en la raíz de la cuenta de servicio
             meta_archivo = {'name': NOMBRE_ARCHIVO_DRIVE}
             drive_service.files().create(body=meta_archivo, media_body=media, fields='id').execute()
     except Exception as e:
@@ -132,6 +135,7 @@ if archivos_cargados:
         progreso = st.progress(0)
         status_text = st.empty()
         
+        # Sincronización automática al hacer clic
         status_text.text("🔄 Sincronizando historial con tu Google Drive...")
         log_historico, file_id = cargar_log_desde_drive()
         
@@ -143,6 +147,7 @@ if archivos_cargados:
                 archivo_bytes = archivo.read()
                 hash_archivo = hashlib.sha256(archivo_bytes).hexdigest()
                 
+                # RECONOCIMIENTO AUTOMÁTICO DE REVISADOS
                 if hash_archivo in log_historico:
                     registro = log_historico[hash_archivo]
                     st.info(f"ℹ️ El documento '{nombre_original}' ya fue revisado el {registro['fecha_revision']}. Omitiendo IA.")
@@ -172,15 +177,11 @@ if archivos_cargados:
                     f_inicio = corregir_formato_fecha(datos.fecha_inicio)
                     f_fin = corregir_formato_fecha(datos.fecha_fin)
                     tipo_doc = datos.tipo_documento.lower().strip()
-                    
-                    # 🛠️ CORRECCIÓN PARA EMPRESAS: Si detecta 'rnc', lo cambia limpiamente por 'póliza'
-                    if "rnc" in tipo_doc:
-                        tipo_doc = "póliza"
-                    
                     nuevo_nombre = f"{datos.nombres.strip()} {datos.apellidos.strip()} - {tipo_doc} - {datos.numero_poliza.strip()} - vigencia {f_inicio} al {f_fin}{extension}"
                 
                 st.session_state.archivos_listos[nuevo_nombre] = archivo_bytes
                 
+                # Actualizar el diccionario local
                 fecha_hoy = datetime.now().strftime("%d/%m/%Y")
                 log_historico[hash_archivo] = {
                     "nombre_original": nombre_original,
@@ -188,7 +189,9 @@ if archivos_cargados:
                     "fecha_revision": fecha_hoy
                 }
                 
+                # GUARDADO DIRECTO AUTOMÁTICO EN TU DRIVE EN TIEMPO REAL
                 guardar_log_en_drive(log_historico, file_id)
+                # Volver a validar el ID por si se acaba de crear el archivo por primera vez
                 if not file_id:
                     log_historico, file_id = cargar_log_desde_drive()
                     
@@ -202,6 +205,7 @@ if archivos_cargados:
             
         status_text.text("✨ ¡Lote completado e historial sincronizado por completo!")
 
+# MOSTRAR EL BOTÓN DE DESCARGA ZIP
 if st.session_state.archivos_listos:
     st.markdown("---")
     st.subheader(f"📦 Resultados listos ({len(st.session_state.archivos_listos)} archivos)")
