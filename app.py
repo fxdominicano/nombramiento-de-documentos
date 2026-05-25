@@ -35,6 +35,11 @@ FILE_ID = st.secrets["DRIVE_FILE_ID"] # ID directo de tu archivo en Drive
 # Conectar de forma segura usando tu bloque JSON de Secrets
 def obtener_servicio_drive():
     info_claves = json.loads(st.secrets["GCP_SERVICE_ACCOUNT"])
+    
+    # 🛠️ SOLUCIÓN AL ERROR PEM: Convierte los textos "\n" en saltos de línea reales de certificado
+    if "private_key" in info_claves:
+        info_claves["private_key"] = info_claves["private_key"].replace("\\n", "\n")
+        
     credenciales = service_account.Credentials.from_service_account_info(
         info_claves, 
         scopes=["https://www.googleapis.com/auth/drive"]
@@ -65,7 +70,6 @@ def guardar_log_en_drive(log_actualizado):
         contenido_json = json.dumps(log_actualizado, ensure_ascii=False, indent=4).encode('utf-8')
         media = MediaInMemoryUpload(contenido_json, mimetype='application/json', resumable=True)
         
-        # Al usar 'update', el archivo mantiene tu autoría y usa tus GB personales
         drive_service.files().update(fileId=FILE_ID, media_body=media).execute()
     except Exception as e:
         st.error(f"❌ Error al actualizar el historial en Google Drive: {e}")
@@ -173,7 +177,6 @@ if archivos_cargados:
                     "fecha_revision": fecha_hoy
                 }
                 
-                # Guarda directamente la actualización
                 guardar_log_en_drive(log_historico)
                 st.success(f"✅ Procesado y sincronizado: {nuevo_nombre}")
                 
