@@ -16,22 +16,21 @@ from googleapiclient.http import MediaIoBaseDownload, MediaInMemoryUpload
 
 st.set_page_config(page_title="Extractor de Seguros IA", page_icon="🌐", layout="centered")
 
-st.title("🌐 Extractor de Seguros - Nube Auto-Sincronizada")
-st.markdown("Procesamiento de pólizas con historial guardado automáticamente en tu Google Drive.")
+st.title("🌐 Extractor de Seguros - Nube Sincronizada")
+st.markdown("Procesamiento de pólizas con historial guardado directamente en tu Google Drive.")
 
 # 1. CONFIGURACIÓN DE SEGURIDAD
-if "GEMINI_API_KEY" in st.secrets and "GCP_SERVICE_ACCOUNT" in st.secrets and "DRIVE_FOLDER_ID" in st.secrets:
+if "GEMINI_API_KEY" in st.secrets and "GCP_SERVICE_ACCOUNT" in st.secrets and "DRIVE_FILE_ID" in st.secrets:
     genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
 else:
-    st.error("🔑 Falta configurar las llaves o el 'DRIVE_FOLDER_ID' en los secretos de Streamlit.")
+    st.error("🔑 Falta configurar 'GEMINI_API_KEY', 'GCP_SERVICE_ACCOUNT' o 'DRIVE_FILE_ID' en los secretos de Streamlit.")
     st.stop()
 
 # Inicializar memoria de la sesión actual
 if "archivos_listos" not in st.session_state:
     st.session_state.archivos_listos = {}
 
-NOMBRE_ARCHIVO_DRIVE = "registro_procesados.json"
-FOLDER_ID = st.secrets["DRIVE_FOLDER_ID"] # ID de tu carpeta personal
+FILE_ID = st.secrets["DRIVE_FILE_ID"] # ID directo de tu archivo en Drive
 
 # Conectar de forma segura usando tu bloque JSON de Secrets
 def obtener_servicio_drive():
@@ -42,23 +41,11 @@ def obtener_servicio_drive():
     )
     return build('drive', 'v3', credentials=credenciales)
 
-# DESCARGA AUTOMÁTICA DESDE TU CARPETA DE DRIVE
+# DESCARGA DIRECTA MEDIANTE ID
 def cargar_log_desde_drive():
     try:
         drive_service = obtener_servicio_drive()
-        # MODIFICACIÓN: Buscar solo dentro de la carpeta compartida especificada
-        resultado = drive_service.files().list(
-            q=f"name='{NOMBRE_ARCHIVO_DRIVE}' and '{FOLDER_ID}' in parents and trashed=false",
-            fields="files(id)",
-            pageSize=1
-        ).execute()
-        
-        archivos = resultado.get('files', [])
-        if not archivos:
-            return {}, None
-            
-        file_id = archivos[0]['id']
-        peticion = drive_service.files().get_media(fileId=file_id)
+        peticion = drive_service.files().get_media(fileId=FILE_ID)
         fh = io.BytesIO()
         descargador = MediaIoBaseDownload(fh, peticion)
         done = False
@@ -66,30 +53,22 @@ def cargar_log_desde_drive():
             _, done = descargador.next_chunk()
             
         fh.seek(0)
-        return json.loads(fh.read().decode('utf-8')), file_id
+        return json.loads(fh.read().decode('utf-8'))
     except Exception as e:
-        st.warning(f"⚠️ No se pudo descargar el historial de Google Drive (Se iniciará uno nuevo): {e}")
-        return {}, None
+        st.error(f"❌ Error crítico al leer el archivo en Google Drive: {e}")
+        return {}
 
-# SUBIDA AUTOMÁTICA A TU CARPETA DE DRIVE
-def guardar_log_en_drive(log_actualizado, file_id):
+# ACTUALIZACIÓN DIRECTA (Bypassea el límite de cuota del bot)
+def guardar_log_en_drive(log_actualizado):
     try:
         drive_service = obtener_servicio_drive()
         contenido_json = json.dumps(log_actualizado, ensure_ascii=False, indent=4).encode('utf-8')
         media = MediaInMemoryUpload(contenido_json, mimetype='application/json', resumable=True)
         
-        if file_id:
-            # Actualizar archivo existente
-            drive_service.files().update(fileId=file_id, media_body=media).execute()
-        else:
-            # MODIFICACIÓN: Forzar a que se cree DENTRO de tu carpeta compartida de Drive
-            meta_archivo = {
-                'name': NOMBRE_ARCHIVO_DRIVE,
-                'parents': [FOLDER_ID]
-            }
-            drive_service.files().create(body=meta_archivo, media_body=media, fields='id').execute()
+        # Al usar 'update', el archivo mantiene tu autoría y usa tus GB personales
+        drive_service.files().update(fileId=FILE_ID, media_body=media).execute()
     except Exception as e:
-        st.error(f"❌ Error al salvar el historial en Google Drive: {e}")
+        st.error(f"❌ Error al actualizar el historial en Google Drive: {e}")
 
 class EsquemaPoliza(BaseModel):
     nombres: str
@@ -139,8 +118,8 @@ if archivos_cargados:
         progreso = st.progress(0)
         status_text = st.empty()
         
-        status_text.text("🔄 Sincronizando historial con tu Google Drive...")
-        log_historico, file_id = cargar_log_desde_drive()
+        status_text.text("🔄 Sincronizando historial desde tu Google Drive...")
+        log_historico = cargar_log_desde_drive()
         
         for index, archivo in enumerate(archivos_cargados):
             nombre_original = archivo.name
@@ -194,11 +173,9 @@ if archivos_cargados:
                     "fecha_revision": fecha_hoy
                 }
                 
-                guardar_log_en_drive(log_historico, file_id)
-                if not file_id:
-                    log_historico, file_id = cargar_log_desde_drive()
-                    
-                st.success(f"✅ Procesado y salvado en Drive: {nuevo_nombre}")
+                # Guarda directamente la actualización
+                guardar_log_en_drive(log_historico)
+                st.success(f"✅ Procesado y sincronizado: {nuevo_nombre}")
                 
             except Exception as e:
                 st.error(f"❌ Error en {nombre_original}: {str(e)}")
@@ -206,7 +183,7 @@ if archivos_cargados:
                 
             progreso.progress((index + 1) / len(archivos_cargados))
             
-        status_text.text("✨ ¡Lote completado e historial sincronizado por completo!")
+        status_text.text("✨ ¡Lote completado e historial sincronizado con éxito!")
 
 if st.session_state.archivos_listos:
     st.markdown("---")
