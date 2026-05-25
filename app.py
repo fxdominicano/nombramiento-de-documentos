@@ -8,12 +8,15 @@ from pydantic import BaseModel
 
 st.set_page_config(page_title="Extractor de Seguros IA", page_icon="🌐", layout="centered")
 
-st.title("🌐 Extractor de Seguros - Canal Local PC")
-st.markdown("Sube tus archivos de pólizas o notas de crédito. Gemini 3.5 Flash los procesará en ráfaga.")
+st.title("🌐 Extractor de Seguros Inteligente")
+st.markdown("Sube tus archivos de pólizas o notas de crédito. Gemini 3.5 Flash los procesará en la nube y te devolverá un ZIP listo con los nombres correctos.")
 
-# API KEY DIRECTA PARA TU PC LOCAL
-GEMINI_API_KEY = "AIzaSyCoL-tqTTNVsnRqhARa9WMbwv1WDVq5ICM"
-genai.configure(api_key=GEMINI_API_KEY)
+# CAMBIO AQUÍ: VALIDACIÓN SEGURA DE LA API KEY EN LOS SECRETOS DE LA NUBE
+if "GEMINI_API_KEY" in st.secrets:
+    genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
+else:
+    st.error("🔑 Falta configurar la API Key en los secretos de Streamlit.")
+    st.stop()
 
 class EsquemaPoliza(BaseModel):
     nombres: str
@@ -43,7 +46,7 @@ def corregir_formato_fecha(fecha_str):
         mes = partes[1].strip().zfill(2)
         anio = partes[2].strip()
         
-        # AJUSTE: Si el año viene de 2 dígitos (ej: "26"), lo convertimos a 4 dígitos ("2026")
+        # Si el año viene de 2 dígitos (ej: "26"), lo convertimos a 4 dígitos ("2026")
         if len(anio) == 2:
             anio = "20" + anio
         return f"{dia}.{mes}.{anio}"
@@ -75,7 +78,6 @@ if archivos_cargados:
                 archivo_bytes = archivo.read()
                 mime_type = "application/pdf" if extension == ".pdf" else "image/jpeg"
                 
-                # Se le especifica explícitamente el formato deseado de 4 dígitos en el año
                 prompt = "Extrae del documento el nombre y apellido del asegurado, tipo de documento, número de póliza exacto y vigencias (con año de 4 dígitos)."
                 
                 respuesta = model.generate_content([
