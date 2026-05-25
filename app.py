@@ -32,11 +32,17 @@ if "archivos_listos" not in st.session_state:
 
 FILE_ID = st.secrets["DRIVE_FILE_ID"] # ID directo de tu archivo en Drive
 
-# Conectar de forma segura usando tu bloque JSON de Secrets
+# Conectar de forma segura manejando diccionarios nativos de Streamlit Secrets
 def obtener_servicio_drive():
-    info_claves = json.loads(st.secrets["GCP_SERVICE_ACCOUNT"])
+    secreto_gcp = st.secrets["GCP_SERVICE_ACCOUNT"]
     
-    # 🛠️ SOLUCIÓN AL ERROR PEM: Convierte los textos "\n" en saltos de línea reales de certificado
+    # Si viene como string (formato viejo), lo convierte; si viene como diccionario (nativo), lo clona
+    if isinstance(secreto_gcp, str):
+        info_claves = json.loads(secreto_gcp)
+    else:
+        info_claves = dict(secreto_gcp)
+    
+    # Asegurar saltos de línea perfectos para la librería de criptografía
     if "private_key" in info_claves:
         info_claves["private_key"] = info_claves["private_key"].replace("\\n", "\n")
         
@@ -63,7 +69,7 @@ def cargar_log_desde_drive():
         st.error(f"❌ Error crítico al leer el archivo en Google Drive: {e}")
         return {}
 
-# ACTUALIZACIÓN DIRECTA (Bypassea el límite de cuota del bot)
+# ACTUALIZACIÓN DIRECTA
 def guardar_log_en_drive(log_actualizado):
     try:
         drive_service = obtener_servicio_drive()
