@@ -14,7 +14,7 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaInMemoryUpload
 
-# Configuración de la página
+# Configuración de la página de Streamlit
 st.set_page_config(page_title="Extractor de Seguros IA", page_icon="🌐", layout="centered")
 
 st.title("🌐 Extractor de Seguros - Nube Sincronizada")
@@ -53,15 +53,25 @@ def obtener_servicio_drive():
     )
     return build('drive', 'v3', credentials=credenciales)
 
-# DESCARGA DIRECTA Y SEGURA DE ARCHIVOS BINARIOS (JSON)
+# LECTURA INTELIGENTE (HÍBRIDA): MANEJA TANTO ARCHIVOS BINARIOS COMO DOCUMENTOS DE GOOGLE
 def cargar_log_desde_drive():
     try:
         drive_service = obtener_servicio_drive()
         
-        # get_media es el método correcto para descargar el archivo .json plano
-        peticion = drive_service.files().get_media(fileId=FILE_ID)
+        # 1. Consultar metadatos para verificar el tipo de archivo (mimeType)
+        metadatos = drive_service.files().get(fileId=FILE_ID, fields="mimeType").execute()
+        mime_type = metadatos.get("mimeType", "")
         
         fh = io.BytesIO()
+        
+        # 2. Elegir el método de descarga correcto según el tipo de archivo
+        if mime_type.startswith("application/vnd.google-apps."):
+            # Es un documento nativo de Google -> Se debe EXPORTAR a texto plano
+            peticion = drive_service.files().export_media(fileId=FILE_ID, mimeType="text/plain")
+        else:
+            # Es un archivo binario estándar (JSON, TXT, etc.) -> Se descarga con GET convencional
+            peticion = drive_service.files().get_media(fileId=FILE_ID)
+            
         descargador = MediaIoBaseDownload(fh, peticion)
         
         done = False
@@ -71,13 +81,13 @@ def cargar_log_desde_drive():
         fh.seek(0)
         contenido = fh.read().decode('utf-8').strip()
         
-        # Si el archivo en Drive está recién creado o vacío, retornamos diccionario vacío
+        # Si el documento en la nube está completamente vacío, devolvemos un diccionario base
         if not contenido:
             return {}
             
         return json.loads(contenido)
     except Exception as e:
-        st.error(f"❌ Error crítico al leer el archivo en Google Drive: {e}")
+        st.error(f"❌ Error crítico al leer el historial en Google Drive: {e}")
         return {}
 
 # ACTUALIZACIÓN DIRECTA DEL LOG EN LA NUBE
@@ -87,6 +97,7 @@ def guardar_log_en_drive(log_actualizado):
         contenido_json = json.dumps(log_actualizado, ensure_ascii=False, indent=4).encode('utf-8')
         media = MediaInMemoryUpload(contenido_json, mimetype='application/json', resumable=True)
         
+        # El método update reemplaza el contenido del archivo sin cambiar su ID
         drive_service.files().update(fileId=FILE_ID, media_body=media).execute()
     except Exception as e:
         st.error(f"❌ Error al actualizar el historial en Google Drive: {e}")
@@ -126,7 +137,7 @@ def corregir_formato_fecha(fecha_str):
         return f"{dia}/{mes}/{anio}"
     return fecha_str
 
-# Interfaz de carga de archivos
+# Interfaz de carga de archivos de Streamlit
 archivos_cargados = st.file_uploader(
     "Arrastra aquí los PDFs o imágenes de los clientes:", 
     type=["pdf", "jpg", "jpeg", "png"], 
@@ -155,7 +166,7 @@ if archivos_cargados:
                 archivo_bytes = archivo.read()
                 hash_archivo = hashlib.sha256(archivo_bytes).hexdigest()
                 
-                # Verificar duplicados en el historial de Google Drive
+                # Verificar duplicados en el historial de Google Drive (Evita gastar tokens de Gemini)
                 if hash_archivo in log_historico:
                     registro = log_historico[hash_archivo]
                     st.info(f"ℹ️ El documento '{nombre_original}' ya fue revisado el {registro['fecha_revision']}. Omitiendo IA.")
@@ -179,7 +190,7 @@ if archivos_cargados:
                 
                 datos = EsquemaPoliza.model_validate_json(respuesta.text)
                 
-                # Manejo de nombres estructurados para evitar errores de concatenación
+                # Estructuración inteligente de nombres para evitar roturas de extensión
                 if "especificado" in datos.nombres.lower() or "especificado" in datos.numero_poliza.lower():
                     nuevo_nombre = f"[MANUAL] - {nombre_original}"
                 else:
@@ -194,7 +205,7 @@ if archivos_cargados:
                 
                 st.session_state.archivos_listos[nuevo_nombre] = archivo_bytes
                 
-                # Guardar registro en el historial con formato DD/MM/AAAA
+                # Guardar registro en el historial con formato (DD/MM/AAAA)
                 fecha_hoy = datetime.now().strftime("%d/%m/%Y")
                 log_historico[hash_archivo] = {
                     "nombre_original": nombre_original,
@@ -213,7 +224,7 @@ if archivos_cargados:
             
         status_text.text("✨ ¡Lote completado e historial sincronizado con éxito!")
 
-# Sección de descarga de resultados (.ZIP)
+# Sección de empaquetado y descarga de resultados (.ZIP)
 if st.session_state.archivos_listos:
     st.markdown("---")
     st.subheader(f"📦 Resultados listos ({len(st.session_state.archivos_listos)} archivos)")
