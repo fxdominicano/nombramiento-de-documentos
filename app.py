@@ -24,7 +24,7 @@ st.markdown("Procesamiento de pólizas con protección de consumo y registro de 
 if "GEMINI_API_KEY" in st.secrets and "GCP_SERVICE_ACCOUNT" in st.secrets:
     genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
 else:
-    st.error("🔑 Falta configurar 'GEMINI_API_KEY' o 'GCP_SERVICE_ACCOUNT' en los secretos de Streamlit.")
+    st.error("🔑 Falta configurar 'GEMINI_API_KEY' o 'GCP_SERVICE_ACCOUNT' in los secretos de Streamlit.")
     st.stop()
 
 # Inicializar memoria de la sesión actual
@@ -184,10 +184,11 @@ if archivos_cargados:
                 archivo_bytes = archivo.read()
                 hash_archivo = hashlib.sha256(archivo_bytes).hexdigest()
                 
-                # Validar si ya se procesó
+                # Validar si ya se procesó en el pasado
                 if hash_archivo in dicc_procesados:
                     registro = dicc_procesados[hash_archivo]
-                    st.info(f"ℹ️ Omitiendo IA para '{nombre_original}'. Encontrado en registro histórico.")
+                    st.info(f"ℹ️ Omitiendo IA para '{nombre_original}'. Recuperado del registro histórico.")
+                    # Lo guardamos en la sesión con su nombre estructurado para permitir su descarga individual inmediata
                     st.session_state.archivos_listos[registro['nombre_nuevo']] = archivo_bytes
                     progreso.progress((index + 1) / len(archivos_cargados))
                     continue
@@ -252,23 +253,42 @@ if archivos_cargados:
             
         status_text.text("✨ ¡Lote finalizado! Historial de control actualizado en la nube.")
 
-# Descarga de resultados estructurados
+# SECCIÓN DE DESCARGAS ACTUALIZADA CON BOTONES INDIVIDUALES
 if st.session_state.archivos_listos:
     st.markdown("---")
     st.subheader(f"📦 Resultados listos ({len(st.session_state.archivos_listos)} archivos)")
     
+    # 1. Botón unificado en ZIP (Para todo el lote)
     zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
         for nombre_archivo, contenido_bytes in st.session_state.archivos_listos.items():
-            zip_file.writestr(nombre_archivo, contenido_bytes)
+            if not nombre_archivo.startswith("[ERROR]"):
+                zip_file.writestr(nombre_archivo, contenido_bytes)
             
     st.download_button(
-        label="💾 Descargar Archivos Organizados (.ZIP)",
+        label="💾 Descargar TODO el Lote Organizado (.ZIP)",
         data=zip_buffer.getvalue(),
         file_name="polizas_organizadas.zip",
         mime="application/zip",
         use_container_width=True
     )
+    
+    st.markdown("### 📄 Descargas Individuales")
+    st.markdown("Haz clic en cualquier archivo procesado para guardarlo de nuevo con su nombre estructurado:")
+    
+    # 2. Generación dinámica de botones de descarga por archivo
+    for nombre_archivo, contenido_bytes in st.session_state.archivos_listos.items():
+        if not nombre_archivo.startswith("[ERROR]"):
+            # Generamos un ID único por archivo usando un hash rápido de su nombre
+            llave_boton = hashlib.md5(nombre_archivo.encode('utf-8')).hexdigest()
+            
+            st.download_button(
+                label=f"⬇️ Descargar: {nombre_archivo}",
+                data=contenido_bytes,
+                file_name=nombre_archivo,
+                mime="application/octet-stream",
+                key=llave_boton
+            )
 
 # 📊 SECCIÓN DE AUDITORÍA
 st.markdown("---")
