@@ -5,6 +5,7 @@ import io
 import zipfile
 import json
 import hashlib
+import time
 from datetime import datetime
 import google.generativeai as genai
 from pydantic import BaseModel
@@ -18,7 +19,7 @@ from googleapiclient.http import MediaIoBaseDownload, MediaInMemoryUpload
 st.set_page_config(page_title="Extractor de Seguros IA", page_icon="🌐", layout="centered")
 
 st.title("🌐 Extractor de Seguros - Nube Sincronizada")
-st.markdown("Procesamiento de pólizas con historial guardado directamente en tu Google Drive.")
+st.markdown("Procesamiento de pólizas con protección de consumo y registro de actividad en Google Drive.")
 
 # 1. CONFIGURACIÓN DE SEGURIDAD Y LLAVES
 if "GEMINI_API_KEY" in st.secrets and "GCP_SERVICE_ACCOUNT" in st.secrets:
@@ -31,13 +32,12 @@ else:
 if "archivos_listos" not in st.session_state:
     st.session_state.archivos_listos = {}
 
-# ID DIRECTO DEL ARCHIVO EN DRIVE
+# ID DIRECTO DEL ARCHIVO EN DRIVE (registro_procesados)
 FILE_ID = "1qC9450pvpyFgTOc6uyDegSmdVjWmT4qM"
 
-# Conectar de forma segura manejando diccionarios nativos de Streamlit Secrets
+# Conectar de forma segura con Google Cloud
 def obtener_servicio_drive():
     secreto_gcp = st.secrets["GCP_SERVICE_ACCOUNT"]
-    
     if isinstance(secreto_gcp, str):
         info_claves = json.loads(secreto_gcp)
     else:
@@ -52,13 +52,12 @@ def obtener_servicio_drive():
     )
     return build('drive', 'v3', credentials=credenciales)
 
-# LECTURA A PRUEBA DE FALLOS: MANEJA TODOS LOS ESCENARIOS DE GOOGLE DRIVE
+# LECTURA EVOLUCIONADA: SOPORTA CAMPOS DE CONTROL DE DUPLICADOS Y LOG DE ERRORES
 def cargar_log_desde_drive():
+    estructura_base = {"procesados": {}, "actividad_reciente": []}
     try:
         drive_service = obtener_servicio_drive()
-        contenido = ""
         
-        # INTENTO 1: Descarga directa (Para archivos .json reales)
         try:
             peticion = drive_service.files().get_media(fileId=FILE_ID)
             fh = io.BytesIO()
@@ -71,13 +70,11 @@ def cargar_log_desde_drive():
         except Exception as e_binario:
             if "fileNotDownloadable" not in str(e_binario):
                 st.error(f"❌ Error de acceso a la API de Drive: {e_binario}")
-                return {}
+                return estructura_base
                 
-            # INTENTO 2: Si es un archivo de Google, determinamos qué tipo es y lo exportamos
             try:
                 metadatos = drive_service.files().get(fileId=FILE_ID, fields="mimeType").execute()
                 mime_type = metadatos.get("mimeType", "")
-                
                 if "spreadsheet" in mime_type:
                     peticion = drive_service.files().export_media(fileId=FILE_ID, mimeType="text/csv")
                 else:
@@ -89,34 +86,38 @@ def cargar_log_desde_drive():
                 while not done:
                     _, done = descargador.next_chunk()
                 contenido = fh.getvalue().decode('utf-8').strip()
-                
-            except Exception as e_export:
-                st.error("❌ El ID de Drive corresponde a un elemento incompatible. Usa el ID de un archivo .json válido.")
-                return {}
+            except Exception:
+                st.error("❌ Elemento de Drive incompatible. Asegúrate de usar un archivo .json válido.")
+                return estructura_base
 
         if not contenido:
-            return {}
-        return json.loads(contenido)
+            return estructura_base
+            
+        datos_cargados = json.loads(contenido)
+        # Migración automática si el formato antiguo no tenía las nuevas llaves
+        if "procesados" not in datos_cargados:
+            return {"procesados": datos_cargados, "actividad_reciente": []}
+            
+        return datos_cargados
         
     except json.JSONDecodeError:
-        st.warning("⚠️ El archivo existe pero no tiene formato JSON válido. Se inicializará un historial nuevo.")
-        return {}
+        st.warning("⚠️ Formato JSON inválido detectado en la nube. Reestructurando historial...")
+        return estructura_base
     except Exception as e:
         st.error(f"❌ Error general al procesar el historial: {e}")
-        return {}
+        return estructura_base
 
-# ACTUALIZACIÓN DIRECTA DEL LOG EN LA NUBE
+# ACTUALIZACIÓN DEL LOG DE ACTIVIDAD COMPLETO
 def guardar_log_en_drive(log_actualizado):
     try:
         drive_service = obtener_servicio_drive()
         contenido_json = json.dumps(log_actualizado, ensure_ascii=False, indent=4).encode('utf-8')
         media = MediaInMemoryUpload(contenido_json, mimetype='application/json', resumable=True)
-        
         drive_service.files().update(fileId=FILE_ID, media_body=media).execute()
     except Exception as e:
         st.error(f"❌ Error al actualizar el historial en Google Drive: {e}")
 
-# Esquema de datos requerido a la IA
+# Esquema de datos para la IA
 class EsquemaPoliza(BaseModel):
     nombres: str
     apellidos: str
@@ -125,7 +126,6 @@ class EsquemaPoliza(BaseModel):
     fecha_inicio: str
     fecha_fin: str
 
-# Configuración del modelo Gemini
 model = genai.GenerativeModel(
     model_name="gemini-3.5-flash",
     generation_config={
@@ -135,11 +135,10 @@ model = genai.GenerativeModel(
     }
 )
 
-# Nuevo formato requerido: dd.MM.AAAA
+# Formateo estricto de fechas solicitado (dd.MM.AAAA)
 def corregir_formato_fecha(fecha_str):
     if not fecha_str or "especificado" in fecha_str.lower():
         return fecha_str
-    # Reemplaza guiones, barras o espacios por puntos
     limpia = re.sub(r'[-/\s]', '.', fecha_str)
     partes = limpia.split('.')
     if len(partes) == 3:
@@ -151,12 +150,15 @@ def corregir_formato_fecha(fecha_str):
         return f"{dia}.{mes}.{anio}"
     return fecha_str
 
-# Interfaz de carga de archivos de Streamlit
+# Interfaz de usuario
 archivos_cargados = st.file_uploader(
-    "Arrastra aquí los PDFs o imágenes de los clientes:", 
+    "Arrastra aquí los PDFs o imágenes de las pólizas:", 
     type=["pdf", "jpg", "jpeg", "png"], 
     accept_multiple_files=True
 )
+
+# Cargar el registro actual de Drive para mostrarlo en la interfaz de forma estática al inicio
+log_completo = cargar_log_desde_drive()
 
 if archivos_cargados:
     st.subheader(f"📋 Archivos listos para procesar: {len(archivos_cargados)}")
@@ -169,21 +171,25 @@ if archivos_cargados:
         progreso = st.progress(0)
         status_text = st.empty()
         
-        status_text.text("🔄 Sincronizando historial desde tu Google Drive...")
-        log_historico = cargar_log_desde_drive()
+        status_text.text("🔄 Sincronizando historial de seguridad desde Drive...")
+        log_completo = cargar_log_desde_drive()
+        
+        dicc_procesados = log_completo["procesados"]
+        lista_actividad = log_completo["actividad_reciente"]
         
         for index, archivo in enumerate(archivos_cargados):
             nombre_original = archivo.name
             extension = os.path.splitext(nombre_original)[1].lower()
+            fecha_hora_accion = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
             
             try:
                 archivo_bytes = archivo.read()
                 hash_archivo = hashlib.sha256(archivo_bytes).hexdigest()
                 
-                # Verificar duplicados en el historial
-                if hash_archivo in log_historico:
-                    registro = log_historico[hash_archivo]
-                    st.info(f"ℹ️ El documento '{nombre_original}' ya fue revisado el {registro['fecha_revision']}. Omitiendo IA.")
+                # EFICIENCIA EXTREMA: Evita duplicidad y consumo de API si ya se procesó con éxito
+                if hash_archivo in dicc_procesados:
+                    registro = dicc_procesados[hash_archivo]
+                    st.info(f"ℹ️ Omitiendo IA para '{nombre_original}'. Encontrado en registro histórico.")
                     st.session_state.archivos_listos[registro['nombre_nuevo']] = archivo_bytes
                     progreso.progress((index + 1) / len(archivos_cargados))
                     continue
@@ -192,15 +198,26 @@ if archivos_cargados:
                     progreso.progress((index + 1) / len(archivos_cargados))
                     continue
                     
-                status_text.text(f"Analizando documento ({index + 1}/{len(archivos_cargados)}): {nombre_original}")
+                status_text.text(f"Analizando póliza ({index + 1}/{len(archivos_cargados)}): {nombre_original}")
                 
                 mime_type = "application/pdf" if extension == ".pdf" else "image/jpeg"
                 prompt = "Extrae del documento el nombre y apellido del asegurado, tipo de documento, número de póliza exacto y vigencias (con año de 4 dígitos)."
                 
-                respuesta = model.generate_content(
-                    [{"mime_type": mime_type, "data": archivo_bytes}, prompt],
-                    request_options={"timeout": 30.0}
-                )
+                # ESCUDO ANTIBLOQUEOS: Tiempo ampliado a 120s y hasta 3 reintentos automáticos si hay caídas (Error 504)
+                respuesta = None
+                for intento in range(3):
+                    try:
+                        respuesta = model.generate_content(
+                            [{"mime_type": mime_type, "data": archivo_bytes}, prompt],
+                            request_options={"timeout": 120.0}
+                        )
+                        break
+                    except Exception as e_ia:
+                        if ("504" in str(e_ia) or "deadline" in str(e_ia).lower()) and intento < 2:
+                            status_text.text(f"⏳ Alerta de red (504). Reintentando análisis de {nombre_original}... ({intento + 1}/3)")
+                            time.sleep(3)
+                        else:
+                            raise e_ia
                 
                 datos = EsquemaPoliza.model_validate_json(respuesta.text)
                 
@@ -209,32 +226,52 @@ if archivos_cargados:
                 else:
                     f_inicio = corregir_formato_fecha(datos.fecha_inicio)
                     f_fin = corregir_formato_fecha(datos.fecha_fin)
-                    
-                    # Estructura requerida: Nombre Cliente - Número de Póliza - vigencia DD.MM.AAAA al DD.MM.AAAA
+                    # Estructura exacta requerida: Nombre Cliente - Número de Póliza - vigencia dd.MM.AAAA al dd.MM.AAAA
                     nuevo_nombre = f"{datos.nombres.strip()} {datos.apellidos.strip()} - {datos.numero_poliza.strip()} - vigencia {f_inicio} al {f_fin}{extension}"
                 
                 st.session_state.archivos_listos[nuevo_nombre] = archivo_bytes
                 
-                # Guardar registro en el historial
-                fecha_hoy = datetime.now().strftime("%d/%m/%Y")
-                log_historico[hash_archivo] = {
+                # Registrar éxito en la base de control de duplicados
+                dicc_procesados[hash_archivo] = {
                     "nombre_original": nombre_original,
                     "nombre_nuevo": nuevo_nombre,
-                    "fecha_revision": fecha_hoy
+                    "fecha_revision": fecha_hora_accion.split()[0]
                 }
                 
-                guardar_log_en_drive(log_historico)
-                st.success(f"✅ Procesado y sincronizado: {nuevo_nombre}")
+                # Añadir al historial de auditoría visual
+                lista_actividad.insert(0, {
+                    "fecha": fecha_hora_accion,
+                    "archivo": nombre_original,
+                    "estado": "Éxito",
+                    "detalle": f"Organizado como: {nuevo_nombre}"
+                })
+                
+                # Mantener el registro de actividad acotado a los últimos 40 movimientos para no sobrecargar el JSON
+                log_completo["actividad_reciente"] = lista_actividad[:40]
+                guardar_log_en_drive(log_completo)
+                
+                st.success(f"✅ Sincronizado correctamente: {nuevo_nombre}")
                 
             except Exception as e:
-                st.error(f"❌ Error en {nombre_original}: {str(e)}")
+                error_msg = str(e)
+                st.error(f"❌ Error en {nombre_original}: {error_msg}")
                 st.session_state.archivos_listos[f"[ERROR] - {nombre_original}"] = archivo_bytes
+                
+                # GUARDAR EL HISTORIAL DE ERRORES (No bloquea el Hash, permitiendo reintentar el archivo en el futuro)
+                lista_actividad.insert(0, {
+                    "fecha": fecha_hora_accion,
+                    "archivo": nombre_original,
+                    "estado": "Error",
+                    "detalle": error_msg[:150]  # Guarda los primeros 150 caracteres del error
+                })
+                log_completo["actividad_reciente"] = lista_actividad[:40]
+                guardar_log_en_drive(log_completo)
                 
             progreso.progress((index + 1) / len(archivos_cargados))
             
-        status_text.text("✨ ¡Lote completado e historial sincronizado con éxito!")
+        status_text.text("✨ ¡Lote finalizado! Historial de control actualizado en la nube.")
 
-# Sección de empaquetado y descarga de resultados (.ZIP)
+# Descarga de resultados estructurados
 if st.session_state.archivos_listos:
     st.markdown("---")
     st.subheader(f"📦 Resultados listos ({len(st.session_state.archivos_listos)} archivos)")
@@ -251,3 +288,17 @@ if st.session_state.archivos_listos:
         mime="application/zip",
         use_container_width=True
     )
+
+# 📊 SECCIÓN DE AUDITORÍA: VISUALIZACIÓN DE ARCHIVOS PROCESADOS Y ERRORES RECIENTES
+st.markdown("---")
+with st.expander("📊 Panel de Control e Historial de Errores (Google Drive)", expanded=True):
+    col1, col2 = st.columns(2)
+    col1.metric("Pólizas en Base de Datos", len(log_completo.get("procesados", {})))
+    col2.metric("Eventos de Actividad Grabados", len(log_completo.get("actividad_reciente", [])))
+    
+    actividades = log_completo.get("actividad_reciente", [])
+    if actividades:
+        st.markdown("**Últimos movimientos detectados en tu cuenta:**")
+        for act in actividades:
+            if act["estado"] == "Éxito":
+                st.caption(f"🟢
