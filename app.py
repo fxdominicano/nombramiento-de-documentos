@@ -5,7 +5,6 @@ import io
 import zipfile
 import json
 import hashlib
-import time
 from datetime import datetime
 import google.generativeai as genai
 from pydantic import BaseModel
@@ -52,7 +51,7 @@ def obtener_servicio_drive():
     )
     return build('drive', 'v3', credentials=credenciales)
 
-# LECTURA EVOLUCIONADA: SOPORTA CAMPOS DE CONTROL DE DUPLICADOS Y LOG DE ERRORES
+# LECTURA EVOLUCIONADA
 def cargar_log_desde_drive():
     estructura_base = {"procesados": {}, "actividad_reciente": []}
     try:
@@ -94,7 +93,6 @@ def cargar_log_desde_drive():
             return estructura_base
             
         datos_cargados = json.loads(contenido)
-        # Migración automática si el formato antiguo no tenía las nuevas llaves
         if "procesados" not in datos_cargados:
             return {"procesados": datos_cargados, "actividad_reciente": []}
             
@@ -107,7 +105,7 @@ def cargar_log_desde_drive():
         st.error(f"❌ Error general al procesar el historial: {e}")
         return estructura_base
 
-# ACTUALIZACIÓN DEL LOG DE ACTIVIDAD COMPLETO
+# ACTUALIZACIÓN DEL LOG DE ACTIVIDAD
 def guardar_log_en_drive(log_actualizado):
     try:
         drive_service = obtener_servicio_drive()
@@ -172,7 +170,6 @@ if archivos_cargados:
         status_text = st.empty()
         
         status_text.text("🔄 Sincronizando historial de seguridad desde Drive...")
-        # Recargamos justo antes de iniciar para asegurar la última versión
         log_completo = cargar_log_desde_drive()
         
         dicc_procesados = log_completo["procesados"]
@@ -187,7 +184,7 @@ if archivos_cargados:
                 archivo_bytes = archivo.read()
                 hash_archivo = hashlib.sha256(archivo_bytes).hexdigest()
                 
-                # EFICIENCIA EXTREMA: Única validación de hash necesaria (cubre históricos y la sesión actual)
+                # Validar si ya se procesó
                 if hash_archivo in dicc_procesados:
                     registro = dicc_procesados[hash_archivo]
                     st.info(f"ℹ️ Omitiendo IA para '{nombre_original}'. Encontrado en registro histórico.")
@@ -200,25 +197,11 @@ if archivos_cargados:
                 mime_type = "application/pdf" if extension == ".pdf" else "image/jpeg"
                 prompt = "Extrae del documento el nombre y apellido del asegurado, tipo de documento, número de póliza exacto y vigencias (con año de 4 dígitos)."
                 
-                # ESCUDO ANTIBLOQUEOS
-                respuesta = None
-                for intento in range(3):
-                    try:
-                        respuesta = model.generate_content(
-                            [{"mime_type": mime_type, "data": archivo_bytes}, prompt],
-                            request_options={"timeout": 120.0}
-                        )
-                        break # Si es exitoso, sale del bucle de reintentos
-                    except Exception as e_ia:
-                        if ("504" in str(e_ia) or "deadline" in str(e_ia).lower()) and intento < 2:
-                            status_text.text(f"⏳ Alerta de red (504). Reintentando análisis de {nombre_original}... ({intento + 1}/3)")
-                            time.sleep(3)
-                        else:
-                            raise e_ia # Fuerza la excepción para ir al bloque except principal
-                
-                # Validamos que la IA realmente respondió
-                if respuesta is None or not respuesta.text:
-                    raise ValueError("La API de Gemini no devolvió ningún contenido.")
+                # LÍMITE ESTRICTO DE TIEMPO: 30 Segundos máximos sin reintentos
+                respuesta = model.generate_content(
+                    [{"mime_type": mime_type, "data": archivo_bytes}, prompt],
+                    request_options={"timeout": 30.0}
+                )
                 
                 datos = EsquemaPoliza.model_validate_json(respuesta.text)
                 
@@ -227,7 +210,6 @@ if archivos_cargados:
                 else:
                     f_inicio = corregir_formato_fecha(datos.fecha_inicio)
                     f_fin = corregir_formato_fecha(datos.fecha_fin)
-                    # Estructura exacta requerida: Nombre Cliente - Número de Póliza - vigencia DD.MM.AAAA al DD.MM.AAAA
                     nuevo_nombre = f"{datos.nombres.strip()} {datos.apellidos.strip()} - {datos.numero_poliza.strip()} - vigencia {f_inicio} al {f_fin}{extension}"
                 
                 st.session_state.archivos_listos[nuevo_nombre] = archivo_bytes
@@ -256,7 +238,7 @@ if archivos_cargados:
                 st.error(f"❌ Error en {nombre_original}: {error_msg}")
                 st.session_state.archivos_listos[f"[ERROR] - {nombre_original}"] = archivo_bytes
                 
-                # GUARDAR EL HISTORIAL DE ERRORES
+                # GUARDAR EL HISTORIAL DE ERRORES (Timeout o archivo corrupto)
                 lista_actividad.insert(0, {
                     "fecha": fecha_hora_accion,
                     "archivo": nombre_original,
