@@ -21,29 +21,28 @@ st.title("🌐 Extractor de Seguros - Nube Sincronizada")
 st.markdown("Procesamiento de pólizas con historial guardado directamente en tu Google Drive.")
 
 # 1. CONFIGURACIÓN DE SEGURIDAD Y LLAVES
-if "GEMINI_API_KEY" in st.secrets and "GCP_SERVICE_ACCOUNT" in st.secrets and "DRIVE_FILE_ID" in st.secrets:
+if "GEMINI_API_KEY" in st.secrets and "GCP_SERVICE_ACCOUNT" in st.secrets:
     genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
 else:
-    st.error("🔑 Falta configurar 'GEMINI_API_KEY', 'GCP_SERVICE_ACCOUNT' o 'DRIVE_FILE_ID' en los secretos de Streamlit.")
+    st.error("🔑 Falta configurar 'GEMINI_API_KEY' o 'GCP_SERVICE_ACCOUNT' en los secretos de Streamlit.")
     st.stop()
 
 # Inicializar memoria de la sesión actual
 if "archivos_listos" not in st.session_state:
     st.session_state.archivos_listos = {}
 
-FILE_ID = st.secrets["DRIVE_FILE_ID"]  # ID directo de tu archivo en Drive
+# ID DIRECTO DEL ARCHIVO EN DRIVE
+FILE_ID = "1qC9450pvpyFgTOc6uyDegSmdVjWmT4qM"
 
 # Conectar de forma segura manejando diccionarios nativos de Streamlit Secrets
 def obtener_servicio_drive():
     secreto_gcp = st.secrets["GCP_SERVICE_ACCOUNT"]
     
-    # Si viene como string lo convierte; si viene como diccionario lo clona
     if isinstance(secreto_gcp, str):
         info_claves = json.loads(secreto_gcp)
     else:
         info_claves = dict(secreto_gcp)
     
-    # Asegurar saltos de línea perfectos para la librería de criptografía
     if "private_key" in info_claves:
         info_claves["private_key"] = info_claves["private_key"].replace("\\n", "\n")
         
@@ -53,41 +52,57 @@ def obtener_servicio_drive():
     )
     return build('drive', 'v3', credentials=credenciales)
 
-# LECTURA INTELIGENTE (HÍBRIDA): MANEJA TANTO ARCHIVOS BINARIOS COMO DOCUMENTOS DE GOOGLE
+# LECTURA A PRUEBA DE FALLOS: MANEJA TODOS LOS ESCENARIOS DE GOOGLE DRIVE
 def cargar_log_desde_drive():
     try:
         drive_service = obtener_servicio_drive()
+        contenido = ""
         
-        # 1. Consultar metadatos para verificar el tipo de archivo (mimeType)
-        metadatos = drive_service.files().get(fileId=FILE_ID, fields="mimeType").execute()
-        mime_type = metadatos.get("mimeType", "")
-        
-        fh = io.BytesIO()
-        
-        # 2. Elegir el método de descarga correcto según el tipo de archivo
-        if mime_type.startswith("application/vnd.google-apps."):
-            # Es un documento nativo de Google -> Se debe EXPORTAR a texto plano
-            peticion = drive_service.files().export_media(fileId=FILE_ID, mimeType="text/plain")
-        else:
-            # Es un archivo binario estándar (JSON, TXT, etc.) -> Se descarga con GET convencional
+        # INTENTO 1: Descarga directa (Para archivos .json reales)
+        try:
             peticion = drive_service.files().get_media(fileId=FILE_ID)
+            fh = io.BytesIO()
+            descargador = MediaIoBaseDownload(fh, peticion)
+            done = False
+            while not done:
+                _, done = descargador.next_chunk()
+            contenido = fh.getvalue().decode('utf-8').strip()
             
-        descargador = MediaIoBaseDownload(fh, peticion)
-        
-        done = False
-        while not done:
-            _, done = descargador.next_chunk()
-            
-        fh.seek(0)
-        contenido = fh.read().decode('utf-8').strip()
-        
-        # Si el documento en la nube está completamente vacío, devolvemos un diccionario base
+        except Exception as e_binario:
+            if "fileNotDownloadable" not in str(e_binario):
+                st.error(f"❌ Error de acceso a la API de Drive: {e_binario}")
+                return {}
+                
+            # INTENTO 2: Si es un archivo de Google, determinamos qué tipo es y lo exportamos
+            try:
+                metadatos = drive_service.files().get(fileId=FILE_ID, fields="mimeType").execute()
+                mime_type = metadatos.get("mimeType", "")
+                
+                if "spreadsheet" in mime_type:
+                    peticion = drive_service.files().export_media(fileId=FILE_ID, mimeType="text/csv")
+                else:
+                    peticion = drive_service.files().export_media(fileId=FILE_ID, mimeType="text/plain")
+                    
+                fh = io.BytesIO()
+                descargador = MediaIoBaseDownload(fh, peticion)
+                done = False
+                while not done:
+                    _, done = descargador.next_chunk()
+                contenido = fh.getvalue().decode('utf-8').strip()
+                
+            except Exception as e_export:
+                st.error("❌ El ID de Drive corresponde a un elemento incompatible. Usa el ID de un archivo .json válido.")
+                return {}
+
         if not contenido:
             return {}
-            
         return json.loads(contenido)
+        
+    except json.JSONDecodeError:
+        st.warning("⚠️ El archivo existe pero no tiene formato JSON válido. Se inicializará un historial nuevo.")
+        return {}
     except Exception as e:
-        st.error(f"❌ Error crítico al leer el historial en Google Drive: {e}")
+        st.error(f"❌ Error general al procesar el historial: {e}")
         return {}
 
 # ACTUALIZACIÓN DIRECTA DEL LOG EN LA NUBE
@@ -97,7 +112,6 @@ def guardar_log_en_drive(log_actualizado):
         contenido_json = json.dumps(log_actualizado, ensure_ascii=False, indent=4).encode('utf-8')
         media = MediaInMemoryUpload(contenido_json, mimetype='application/json', resumable=True)
         
-        # El método update reemplaza el contenido del archivo sin cambiar su ID
         drive_service.files().update(fileId=FILE_ID, media_body=media).execute()
     except Exception as e:
         st.error(f"❌ Error al actualizar el historial en Google Drive: {e}")
@@ -121,20 +135,20 @@ model = genai.GenerativeModel(
     }
 )
 
-# Corrección adaptada al formato preferido (DD/MM/AAAA)
+# Nuevo formato requerido: dd.MM.AAAA
 def corregir_formato_fecha(fecha_str):
     if not fecha_str or "especificado" in fecha_str.lower():
         return fecha_str
-    # Reemplaza guiones, puntos o espacios por barras oblicuas
-    limpia = re.sub(r'[-.\s]', '/', fecha_str)
-    partes = limpia.split('/')
+    # Reemplaza guiones, barras o espacios por puntos
+    limpia = re.sub(r'[-/\s]', '.', fecha_str)
+    partes = limpia.split('.')
     if len(partes) == 3:
         dia = partes[0].strip().zfill(2)
         mes = partes[1].strip().zfill(2)
         anio = partes[2].strip()
         if len(anio) == 2:
             anio = "20" + anio
-        return f"{dia}/{mes}/{anio}"
+        return f"{dia}.{mes}.{anio}"
     return fecha_str
 
 # Interfaz de carga de archivos de Streamlit
@@ -166,7 +180,7 @@ if archivos_cargados:
                 archivo_bytes = archivo.read()
                 hash_archivo = hashlib.sha256(archivo_bytes).hexdigest()
                 
-                # Verificar duplicados en el historial de Google Drive (Evita gastar tokens de Gemini)
+                # Verificar duplicados en el historial
                 if hash_archivo in log_historico:
                     registro = log_historico[hash_archivo]
                     st.info(f"ℹ️ El documento '{nombre_original}' ya fue revisado el {registro['fecha_revision']}. Omitiendo IA.")
@@ -190,22 +204,18 @@ if archivos_cargados:
                 
                 datos = EsquemaPoliza.model_validate_json(respuesta.text)
                 
-                # Estructuración inteligente de nombres para evitar roturas de extensión
                 if "especificado" in datos.nombres.lower() or "especificado" in datos.numero_poliza.lower():
                     nuevo_nombre = f"[MANUAL] - {nombre_original}"
                 else:
                     f_inicio = corregir_formato_fecha(datos.fecha_inicio)
                     f_fin = corregir_formato_fecha(datos.fecha_fin)
-                    tipo_doc = datos.tipo_documento.lower().strip()
                     
-                    if "rnc" in tipo_doc:
-                        tipo_doc = "póliza"
-                    
-                    nuevo_nombre = f"{datos.nombres.strip()} {datos.apellidos.strip()} - {tipo_doc} - {datos.numero_poliza.strip()} - vigencia {f_inicio} al {f_fin}{extension}"
+                    # Estructura requerida: Nombre Cliente - Número de Póliza - vigencia DD.MM.AAAA al DD.MM.AAAA
+                    nuevo_nombre = f"{datos.nombres.strip()} {datos.apellidos.strip()} - {datos.numero_poliza.strip()} - vigencia {f_inicio} al {f_fin}{extension}"
                 
                 st.session_state.archivos_listos[nuevo_nombre] = archivo_bytes
                 
-                # Guardar registro en el historial con formato (DD/MM/AAAA)
+                # Guardar registro en el historial
                 fecha_hoy = datetime.now().strftime("%d/%m/%Y")
                 log_historico[hash_archivo] = {
                     "nombre_original": nombre_original,
