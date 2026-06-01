@@ -135,7 +135,7 @@ model = genai.GenerativeModel(
     }
 )
 
-# Formateo estricto de fechas solicitado (dd.MM.AAAA)
+# Formateo estricto de fechas (dd.MM.AAAA)
 def corregir_formato_fecha(fecha_str):
     if not fecha_str or "especificado" in fecha_str.lower():
         return fecha_str
@@ -157,7 +157,7 @@ archivos_cargados = st.file_uploader(
     accept_multiple_files=True
 )
 
-# Cargar el registro actual de Drive para mostrarlo en la interfaz de forma estática al inicio
+# Cargar el registro actual de Drive para mostrarlo en la interfaz
 log_completo = cargar_log_desde_drive()
 
 if archivos_cargados:
@@ -172,6 +172,7 @@ if archivos_cargados:
         status_text = st.empty()
         
         status_text.text("🔄 Sincronizando historial de seguridad desde Drive...")
+        # Recargamos justo antes de iniciar para asegurar la última versión
         log_completo = cargar_log_desde_drive()
         
         dicc_procesados = log_completo["procesados"]
@@ -186,15 +187,11 @@ if archivos_cargados:
                 archivo_bytes = archivo.read()
                 hash_archivo = hashlib.sha256(archivo_bytes).hexdigest()
                 
-                # EFICIENCIA EXTREMA: Evita duplicidad y consumo de API si ya se procesó con éxito
+                # EFICIENCIA EXTREMA: Única validación de hash necesaria (cubre históricos y la sesión actual)
                 if hash_archivo in dicc_procesados:
                     registro = dicc_procesados[hash_archivo]
                     st.info(f"ℹ️ Omitiendo IA para '{nombre_original}'. Encontrado en registro histórico.")
                     st.session_state.archivos_listos[registro['nombre_nuevo']] = archivo_bytes
-                    progreso.progress((index + 1) / len(archivos_cargados))
-                    continue
-                
-                if nombre_original in st.session_state.archivos_listos:
                     progreso.progress((index + 1) / len(archivos_cargados))
                     continue
                     
@@ -203,7 +200,7 @@ if archivos_cargados:
                 mime_type = "application/pdf" if extension == ".pdf" else "image/jpeg"
                 prompt = "Extrae del documento el nombre y apellido del asegurado, tipo de documento, número de póliza exacto y vigencias (con año de 4 dígitos)."
                 
-                # ESCUDO ANTIBLOQUEOS: Tiempo ampliado a 120s y hasta 3 reintentos automáticos si hay caídas (Error 504)
+                # ESCUDO ANTIBLOQUEOS
                 respuesta = None
                 for intento in range(3):
                     try:
@@ -211,13 +208,17 @@ if archivos_cargados:
                             [{"mime_type": mime_type, "data": archivo_bytes}, prompt],
                             request_options={"timeout": 120.0}
                         )
-                        break
+                        break # Si es exitoso, sale del bucle de reintentos
                     except Exception as e_ia:
                         if ("504" in str(e_ia) or "deadline" in str(e_ia).lower()) and intento < 2:
                             status_text.text(f"⏳ Alerta de red (504). Reintentando análisis de {nombre_original}... ({intento + 1}/3)")
                             time.sleep(3)
                         else:
-                            raise e_ia
+                            raise e_ia # Fuerza la excepción para ir al bloque except principal
+                
+                # Validamos que la IA realmente respondió
+                if respuesta is None or not respuesta.text:
+                    raise ValueError("La API de Gemini no devolvió ningún contenido.")
                 
                 datos = EsquemaPoliza.model_validate_json(respuesta.text)
                 
@@ -226,19 +227,18 @@ if archivos_cargados:
                 else:
                     f_inicio = corregir_formato_fecha(datos.fecha_inicio)
                     f_fin = corregir_formato_fecha(datos.fecha_fin)
-                    # Estructura exacta requerida: Nombre Cliente - Número de Póliza - vigencia dd.MM.AAAA al dd.MM.AAAA
+                    # Estructura exacta requerida: Nombre Cliente - Número de Póliza - vigencia DD.MM.AAAA al DD.MM.AAAA
                     nuevo_nombre = f"{datos.nombres.strip()} {datos.apellidos.strip()} - {datos.numero_poliza.strip()} - vigencia {f_inicio} al {f_fin}{extension}"
                 
                 st.session_state.archivos_listos[nuevo_nombre] = archivo_bytes
                 
-                # Registrar éxito en la base de control de duplicados
+                # Registrar éxito
                 dicc_procesados[hash_archivo] = {
                     "nombre_original": nombre_original,
                     "nombre_nuevo": nuevo_nombre,
                     "fecha_revision": fecha_hora_accion.split()[0]
                 }
                 
-                # Añadir al historial de auditoría visual
                 lista_actividad.insert(0, {
                     "fecha": fecha_hora_accion,
                     "archivo": nombre_original,
@@ -246,7 +246,6 @@ if archivos_cargados:
                     "detalle": f"Organizado como: {nuevo_nombre}"
                 })
                 
-                # Mantener el registro de actividad acotado a los últimos 40 movimientos para no sobrecargar el JSON
                 log_completo["actividad_reciente"] = lista_actividad[:40]
                 guardar_log_en_drive(log_completo)
                 
@@ -257,12 +256,12 @@ if archivos_cargados:
                 st.error(f"❌ Error en {nombre_original}: {error_msg}")
                 st.session_state.archivos_listos[f"[ERROR] - {nombre_original}"] = archivo_bytes
                 
-                # GUARDAR EL HISTORIAL DE ERRORES (No bloquea el Hash, permitiendo reintentar el archivo en el futuro)
+                # GUARDAR EL HISTORIAL DE ERRORES
                 lista_actividad.insert(0, {
                     "fecha": fecha_hora_accion,
                     "archivo": nombre_original,
                     "estado": "Error",
-                    "detalle": error_msg[:150]  # Guarda los primeros 150 caracteres del error
+                    "detalle": error_msg[:150]
                 })
                 log_completo["actividad_reciente"] = lista_actividad[:40]
                 guardar_log_en_drive(log_completo)
@@ -289,7 +288,7 @@ if st.session_state.archivos_listos:
         use_container_width=True
     )
 
-# 📊 SECCIÓN DE AUDITORÍA: VISUALIZACIÓN DE ARCHIVOS PROCESADOS Y ERRORES RECIENTES
+# 📊 SECCIÓN DE AUDITORÍA
 st.markdown("---")
 with st.expander("📊 Panel de Control e Historial de Errores (Google Drive)", expanded=True):
     col1, col2 = st.columns(2)
@@ -301,4 +300,8 @@ with st.expander("📊 Panel de Control e Historial de Errores (Google Drive)", 
         st.markdown("**Últimos movimientos detectados en tu cuenta:**")
         for act in actividades:
             if act["estado"] == "Éxito":
-                st.caption(f"🟢
+                st.caption(f"🟢 **[{act['fecha']}]** {act['archivo']} ➔ *{act['detalle']}*")
+            else:
+                st.caption(f"🔴 **[{act['fecha']}] FALLÓ:** {act['archivo']} ➔ `{act['detalle']}`")
+    else:
+        st.info("No se registran movimientos en el historial de actividad de este archivo JSON.")
