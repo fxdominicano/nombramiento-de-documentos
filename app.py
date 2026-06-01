@@ -36,13 +36,11 @@ FILE_ID = st.secrets["DRIVE_FILE_ID"] # ID directo de tu archivo en Drive
 def obtener_servicio_drive():
     secreto_gcp = st.secrets["GCP_SERVICE_ACCOUNT"]
     
-    # Si viene como string (formato viejo), lo convierte; si viene como diccionario (nativo), lo clona
     if isinstance(secreto_gcp, str):
         info_claves = json.loads(secreto_gcp)
     else:
         info_claves = dict(secreto_gcp)
     
-    # Asegurar saltos de línea perfectos para la librería de criptografía
     if "private_key" in info_claves:
         info_claves["private_key"] = info_claves["private_key"].replace("\\n", "\n")
         
@@ -52,19 +50,37 @@ def obtener_servicio_drive():
     )
     return build('drive', 'v3', credentials=credenciales)
 
-# DESCARGA DIRECTA MEDIANTE ID
+# DESCARGA MANEJANDO ARCHIVOS BINARIOS Y DOCUMENTOS EDITORES DE GOOGLE
 def cargar_log_desde_drive():
     try:
         drive_service = obtener_servicio_drive()
-        peticion = drive_service.files().get_media(fileId=FILE_ID)
+        
+        # 1. Obtener metadatos para verificar el tipo de archivo (mimeType)
+        metadatos = drive_service.files().get(fileId=FILE_ID, fields="mimeType").execute()
+        mime_type = metadatos.get("mimeType", "")
+        
         fh = io.BytesIO()
+        
+        # 2. Si es un archivo nativo de Google, lo exportamos como texto plano
+        if mime_type.startswith("application/vnd.google-apps."):
+            peticion = drive_service.files().export_media(fileId=FILE_ID, mimeType="text/plain")
+        else:
+            # Si es un archivo binario normal (.json subido directamente)
+            peticion = drive_service.files().get_media(fileId=FILE_ID)
+            
         descargador = MediaIoBaseDownload(fh, peticion)
         done = False
         while not done:
             _, done = descargador.next_chunk()
             
         fh.seek(0)
-        return json.loads(fh.read().decode('utf-8'))
+        contenido = fh.read().decode('utf-8').strip()
+        
+        # Si el archivo está vacío, retornamos diccionario vacío
+        if not contenido:
+            return {}
+            
+        return json.loads(contenido)
     except Exception as e:
         st.error(f"❌ Error crítico al leer el archivo en Google Drive: {e}")
         return {}
@@ -97,18 +113,19 @@ model = genai.GenerativeModel(
     }
 )
 
+# Corrección adaptada a tu formato preferido (DD/MM/AAAA)
 def corregir_formato_fecha(fecha_str):
     if not fecha_str or "especificado" in fecha_str.lower():
         return fecha_str
-    limpia = re.sub(r'[-/\s]', '.', fecha_str)
-    partes = limpia.split('.')
+    limpia = re.sub(r'[-.\s]', '/', fecha_str) # Cambiado para usar '/'
+    partes = limpia.split('/')
     if len(partes) == 3:
         dia = partes[0].strip().zfill(2)
         mes = partes[1].strip().zfill(2)
         anio = partes[2].strip()
         if len(anio) == 2:
             anio = "20" + anio
-        return f"{dia}.{mes}.{anio}"
+        return f"{dia}/{mes}/{anio}"
     return fecha_str
 
 archivos_cargados = st.file_uploader(
