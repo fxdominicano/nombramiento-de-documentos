@@ -5,6 +5,7 @@ import io
 import zipfile
 import json
 import hashlib
+import time
 from datetime import datetime
 import google.generativeai as genai
 from pydantic import BaseModel
@@ -120,7 +121,7 @@ class EsquemaPoliza(BaseModel):
     nombres: str
     apellidos: str
     tipo_documento: str
-    concepto: str  # Extrae si es Factura de Ajuste, Renovación, Inclusión, Póliza nueva, etc.
+    concepto: str  
     numero_poliza: str
     fecha_inicio: str
     fecha_fin: str
@@ -192,12 +193,9 @@ if archivos_cargados:
                     st.session_state.archivos_listos[registro['nombre_nuevo']] = archivo_bytes
                     progreso.progress((index + 1) / len(archivos_cargados))
                     continue
-                    
-                status_text.text(f"Analizando póliza ({index + 1}/{len(archivos_cargados)}): {nombre_original}")
                 
                 mime_type = "application/pdf" if extension == ".pdf" else "image/jpeg"
                 
-                # PROMPT ROBUSTO: Ahora solicita explícitamente el tipo de documento (Concepto)
                 prompt = (
                     "Analiza minuciosamente el documento de seguro. Extrae el nombre y apellido del asegurado, "
                     "tipo de documento, número de póliza exacto y el Concepto/Tipo de movimiento (ej. 'Factura Ajuste', "
@@ -209,11 +207,27 @@ if archivos_cargados:
                     "si difieren de la vigencia del documento principal de la carátula."
                 )
                 
-                # LÍMITE ESTRICTO DE TIEMPO: 30 Segundos máximos sin reintentos
-                respuesta = model.generate_content(
-                    [{"mime_type": mime_type, "data": archivo_bytes}, prompt],
-                    request_options={"timeout": 30.0}
-                )
+                # LÓGICA ROBUSTA DE CONTROL DE TIEMPO Y REINTENTOS AUTOMÁTICOS
+                intentos_maximos = 2
+                respuesta = None
+                
+                for intento in range(intentos_maximos):
+                    try:
+                        status_text.text(f"Analizando póliza ({index + 1}/{len(archivos_cargados)}): {nombre_original} [Intento {intento + 1}]")
+                        
+                        # Timeout elevado a 60 segundos por intento
+                        respuesta = model.generate_content(
+                            [{"mime_type": mime_type, "data": archivo_bytes}, prompt],
+                            request_options={"timeout": 60.0}
+                        )
+                        if respuesta:
+                            break  # Éxito en la conexión, salimos del bucle de intentos
+                    except Exception as e_ia:
+                        if intento < intentos_maximos - 1:
+                            st.warning(f"⚠️ El intento {intento + 1} para '{nombre_original}' tomó demasiado tiempo. Reintentando de forma automática...")
+                            time.sleep(2)  # Pausa de estabilización
+                        else:
+                            raise e_ia  # Si falla el segundo intento, escala la excepción al bloque general
                 
                 datos = EsquemaPoliza.model_validate_json(respuesta.text)
                 
@@ -223,10 +237,10 @@ if archivos_cargados:
                     f_inicio = corregir_formato_fecha(datos.fecha_inicio)
                     f_fin = corregir_formato_fecha(datos.fecha_fin)
                     
-                    # Control防 para concepto vacío
+                    # Control para concepto vacío
                     tipo_doc = datos.concepto.strip() if datos.concepto else "DOCUMENTO"
                     
-                    # Ensamblaje perfecto: Nombre - PÓLIZA - Tipo Documento - Número - Vigencias
+                    # Estructura final unificada en MAYÚSCULAS
                     cadena_nombre = f"{datos.nombres.strip()} {datos.apellidos.strip()} - PÓLIZA - {tipo_doc} - {datos.numero_poliza.strip()} - vigencia {f_inicio} al {f_fin}{extension}"
                     nuevo_nombre = cadena_nombre.upper()
                 
