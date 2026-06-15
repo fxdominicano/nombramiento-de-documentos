@@ -115,11 +115,12 @@ def guardar_log_en_drive(log_actualizado):
     except Exception as e:
         st.error(f"❌ Error al actualizar el historial en Google Drive: {e}")
 
-# Esquema de datos para la IA
+# Esquema de datos ampliado para incluir el tipo de documento (concepto)
 class EsquemaPoliza(BaseModel):
     nombres: str
     apellidos: str
     tipo_documento: str
+    concepto: str  # Extrae si es Factura de Ajuste, Renovación, Inclusión, Póliza nueva, etc.
     numero_poliza: str
     fecha_inicio: str
     fecha_fin: str
@@ -195,7 +196,18 @@ if archivos_cargados:
                 status_text.text(f"Analizando póliza ({index + 1}/{len(archivos_cargados)}): {nombre_original}")
                 
                 mime_type = "application/pdf" if extension == ".pdf" else "image/jpeg"
-                prompt = "Extrae del documento el nombre y apellido del asegurado, tipo de documento, número de póliza exacto y vigencias (con año de 4 dígitos)."
+                
+                # PROMPT ROBUSTO: Ahora solicita explícitamente el tipo de documento (Concepto)
+                prompt = (
+                    "Analiza minuciosamente el documento de seguro. Extrae el nombre y apellido del asegurado, "
+                    "tipo de documento, número de póliza exacto y el Concepto/Tipo de movimiento (ej. 'Factura Ajuste', "
+                    "'Renovación', 'Inclusión', 'Póliza Nueva'). "
+                    "CRÍTICO PARA LAS VIGENCIAS: Busca el bloque principal de vigencia del movimiento o factura actual "
+                    "(usualmente en la primera página o cabecera, junto a los datos del caso). "
+                    "Si encuentras un rango corto que indica vigencia de un ajuste o endoso (ej. 'Desde 13/05/2026 Hasta 31/05/2026'), "
+                    "extrae ESE rango obligatoriamente. No utilices vigencias anuales históricas de páginas secundarias "
+                    "si difieren de la vigencia del documento principal de la carátula."
+                )
                 
                 # LÍMITE ESTRICTO DE TIEMPO: 30 Segundos máximos sin reintentos
                 respuesta = model.generate_content(
@@ -210,8 +222,12 @@ if archivos_cargados:
                 else:
                     f_inicio = corregir_formato_fecha(datos.fecha_inicio)
                     f_fin = corregir_formato_fecha(datos.fecha_fin)
-                    # Formateo estructurado agregando "- PÓLIZA" y convirtiendo todo a MAYÚSCULAS
-                    cadena_nombre = f"{datos.nombres.strip()} {datos.apellidos.strip()} - PÓLIZA - {datos.numero_poliza.strip()} - vigencia {f_inicio} al {f_fin}{extension}"
+                    
+                    # Control防 para concepto vacío
+                    tipo_doc = datos.concepto.strip() if datos.concepto else "DOCUMENTO"
+                    
+                    # Ensamblaje perfecto: Nombre - PÓLIZA - Tipo Documento - Número - Vigencias
+                    cadena_nombre = f"{datos.nombres.strip()} {datos.apellidos.strip()} - PÓLIZA - {tipo_doc} - {datos.numero_poliza.strip()} - vigencia {f_inicio} al {f_fin}{extension}"
                     nuevo_nombre = cadena_nombre.upper()
                 
                 st.session_state.archivos_listos[nuevo_nombre] = archivo_bytes
