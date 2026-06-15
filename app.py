@@ -24,7 +24,7 @@ st.markdown("Procesamiento de pólizas con protección de consumo y registro de 
 if "GEMINI_API_KEY" in st.secrets and "GCP_SERVICE_ACCOUNT" in st.secrets:
     genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
 else:
-    st.error("🔑 Falta configurar 'GEMINI_API_KEY' o 'GCP_SERVICE_ACCOUNT' in los secretos de Streamlit.")
+    st.error("🔑 Falta configurar 'GEMINI_API_KEY' o 'GCP_SERVICE_ACCOUNT' en los secretos de Streamlit.")
     st.stop()
 
 # Inicializar memoria de la sesión actual
@@ -188,7 +188,6 @@ if archivos_cargados:
                 if hash_archivo in dicc_procesados:
                     registro = dicc_procesados[hash_archivo]
                     st.info(f"ℹ️ Omitiendo IA para '{nombre_original}'. Recuperado del registro histórico.")
-                    # Lo guardamos en la sesión con su nombre estructurado para permitir su descarga individual inmediata
                     st.session_state.archivos_listos[registro['nombre_nuevo']] = archivo_bytes
                     progreso.progress((index + 1) / len(archivos_cargados))
                     continue
@@ -207,11 +206,13 @@ if archivos_cargados:
                 datos = EsquemaPoliza.model_validate_json(respuesta.text)
                 
                 if "especificado" in datos.nombres.lower() or "especificado" in datos.numero_poliza.lower():
-                    nuevo_nombre = f"[MANUAL] - {nombre_original}"
+                    nuevo_nombre = f"[MANUAL] - {nombre_original}".upper()
                 else:
                     f_inicio = corregir_formato_fecha(datos.fecha_inicio)
                     f_fin = corregir_formato_fecha(datos.fecha_fin)
-                    nuevo_nombre = f"{datos.nombres.strip()} {datos.apellidos.strip()} - {datos.numero_poliza.strip()} - vigencia {f_inicio} al {f_fin}{extension}"
+                    # Formateo estructurado agregando "- PÓLIZA" y convirtiendo todo a MAYÚSCULAS
+                    cadena_nombre = f"{datos.nombres.strip()} {datos.apellidos.strip()} - PÓLIZA - {datos.numero_poliza.strip()} - vigencia {f_inicio} al {f_fin}{extension}"
+                    nuevo_nombre = cadena_nombre.upper()
                 
                 st.session_state.archivos_listos[nuevo_nombre] = archivo_bytes
                 
@@ -237,7 +238,7 @@ if archivos_cargados:
             except Exception as e:
                 error_msg = str(e)
                 st.error(f"❌ Error en {nombre_original}: {error_msg}")
-                st.session_state.archivos_listos[f"[ERROR] - {nombre_original}"] = archivo_bytes
+                st.session_state.archivos_listos[f"[ERROR] - {nombre_original}".upper()] = archivo_bytes
                 
                 # GUARDAR EL HISTORIAL DE ERRORES (Timeout o archivo corrupto)
                 lista_actividad.insert(0, {
@@ -279,7 +280,6 @@ if st.session_state.archivos_listos:
     # 2. Generación dinámica de botones de descarga por archivo
     for nombre_archivo, contenido_bytes in st.session_state.archivos_listos.items():
         if not nombre_archivo.startswith("[ERROR]"):
-            # Generamos un ID único por archivo usando un hash rápido de su nombre
             llave_boton = hashlib.md5(nombre_archivo.encode('utf-8')).hexdigest()
             
             st.download_button(
