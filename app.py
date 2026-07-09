@@ -197,37 +197,61 @@ if archivos_cargados:
                 mime_type = "application/pdf" if extension == ".pdf" else "image/jpeg"
                 
                 prompt = (
-                    "Analiza minuciosamente el documento de seguro. Extrae el nombre y apellido del asegurado, "
-                    "tipo de documento, número de póliza exacto y el Concepto/Tipo de movimiento (ej. 'Factura Ajuste', "
-                    "'Renovación', 'Inclusión', 'Póliza Nueva'). "
-                    "CRÍTICO PARA LAS VIGENCIAS: Busca el bloque principal de vigencia del movimiento o factura actual "
-                    "(usualmente en la primera página o cabecera, junto a los datos del caso). "
+                    "Analiza minuciosamente el documento de seguro. Concéntrate PRINCIPALMENTE en la primera página o carátula. "
+                    "Extrae el nombre y apellido del asegurado, tipo de documento, número de póliza exacto y el Concepto/Tipo de movimiento "
+                    "(ej. 'Factura Ajuste', 'Renovación', 'Inclusión', 'Póliza Nueva'). "
+                    "CRÍTICO PARA LAS VIGENCIAS: Busca el bloque principal de vigencia del movimiento o factura actual. "
                     "Si encuentras un rango corto que indica vigencia de un ajuste o endoso (ej. 'Desde 13/05/2026 Hasta 31/05/2026'), "
-                    "extrae ESE rango obligatoriamente. No utilices vigencias anuales históricas de páginas secundarias "
-                    "si difieren de la vigencia del documento principal de la carátula."
+                    "extrae ESE rango obligatoriamente. No utilices vigencias anuales históricas de páginas secundarias."
                 )
                 
-                # LÓGICA ROBUSTA DE CONTROL DE TIEMPO Y REINTENTOS AUTOMÁTICOS
                 intentos_maximos = 2
                 respuesta = None
+                nombre_temporal = f"temp_{hash_archivo}{extension}"
                 
                 for intento in range(intentos_maximos):
+                    archivo_gai = None
                     try:
                         status_text.text(f"Analizando póliza ({index + 1}/{len(archivos_cargados)}): {nombre_original} [Intento {intento + 1}]")
                         
-                        # Timeout elevado a 60 segundos por intento
+                        # 1. Escribir archivo temporal en disco local del servidor Streamlit
+                        with open(nombre_temporal, "wb") as f:
+                            f.write(archivo_bytes)
+                        
+                        # 2. Subir mediante la File API oficial de Google
+                        archivo_gai = genai.upload_file(path=nombre_temporal, mime_type=mime_type)
+                        
+                        # Pausa de seguridad para que los servidores de Google indexen el archivo
+                        time.sleep(2)
+                        
+                        # 3. Procesar pasando la referencia de la nube, con timeout elevado a 90 segundos
                         respuesta = model.generate_content(
-                            [{"mime_type": mime_type, "data": archivo_bytes}, prompt],
-                            request_options={"timeout": 60.0}
+                            [archivo_gai, prompt],
+                            request_options={"timeout": 90.0}
                         )
+                        
                         if respuesta:
-                            break  # Éxito en la conexión, salimos del bucle de intentos
+                            break  # Éxito en la conexión, salimos del bucle
+                            
                     except Exception as e_ia:
                         if intento < intentos_maximos - 1:
-                            st.warning(f"⚠️ El intento {intento + 1} para '{nombre_original}' tomó demasiado tiempo. Reintentando de forma automática...")
-                            time.sleep(2)  # Pausa de estabilización
+                            st.warning(f"⚠️ El intento {intento + 1} para '{nombre_original}' tomó demasiado tiempo o falló. Reintentando...")
+                            time.sleep(3)  
                         else:
-                            raise e_ia  # Si falla el segundo intento, escala la excepción al bloque general
+                            raise e_ia  
+                            
+                    finally:
+                        # 4. LIMPIEZA OBLIGATORIA: Previene que tu servidor se quede sin espacio
+                        if archivo_gai:
+                            try:
+                                archivo_gai.delete()
+                            except:
+                                pass
+                        if os.path.exists(nombre_temporal):
+                            try:
+                                os.remove(nombre_temporal)
+                            except:
+                                pass
                 
                 datos = EsquemaPoliza.model_validate_json(respuesta.text)
                 
@@ -237,16 +261,13 @@ if archivos_cargados:
                     f_inicio = corregir_formato_fecha(datos.fecha_inicio)
                     f_fin = corregir_formato_fecha(datos.fecha_fin)
                     
-                    # Control para concepto vacío
                     tipo_doc = datos.concepto.strip() if datos.concepto else "DOCUMENTO"
                     
-                    # Estructura final unificada en MAYÚSCULAS
                     cadena_nombre = f"{datos.nombres.strip()} {datos.apellidos.strip()} - PÓLIZA - {tipo_doc} - {datos.numero_poliza.strip()} - vigencia {f_inicio} al {f_fin}{extension}"
                     nuevo_nombre = cadena_nombre.upper()
                 
                 st.session_state.archivos_listos[nuevo_nombre] = archivo_bytes
                 
-                # Registrar éxito
                 dicc_procesados[hash_archivo] = {
                     "nombre_original": nombre_original,
                     "nombre_nuevo": nuevo_nombre,
@@ -270,7 +291,6 @@ if archivos_cargados:
                 st.error(f"❌ Error en {nombre_original}: {error_msg}")
                 st.session_state.archivos_listos[f"[ERROR] - {nombre_original}".upper()] = archivo_bytes
                 
-                # GUARDAR EL HISTORIAL DE ERRORES (Timeout o archivo corrupto)
                 lista_actividad.insert(0, {
                     "fecha": fecha_hora_accion,
                     "archivo": nombre_original,
