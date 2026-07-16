@@ -135,19 +135,23 @@ model = genai.GenerativeModel(
     }
 )
 
-# Formateo estricto de fechas (dd.MM.AAAA)
+# Formateo estricto de fechas (DD/MM/AAAA)
 def corregir_formato_fecha(fecha_str):
     if not fecha_str or "especificado" in fecha_str.lower():
         return fecha_str
-    limpia = re.sub(r'[-/\s]', '.', fecha_str)
-    partes = limpia.split('.')
+    
+    # Normalizamos cualquier separador a una barra diagonal
+    limpia = re.sub(r'[-/.\s]', '/', fecha_str)
+    partes = limpia.split('/')
+    
     if len(partes) == 3:
         dia = partes[0].strip().zfill(2)
         mes = partes[1].strip().zfill(2)
         anio = partes[2].strip()
         if len(anio) == 2:
             anio = "20" + anio
-        return f"{dia}.{mes}.{anio}"
+        return f"{dia}/{mes}/{anio}"
+        
     return fecha_str
 
 # Interfaz de usuario
@@ -174,8 +178,8 @@ if archivos_cargados:
         status_text.text("🔄 Sincronizando historial de seguridad desde Drive...")
         log_completo = cargar_log_desde_drive()
         
-        dicc_procesados = log_completo["procesados"]
-        lista_actividad = log_completo["actividad_reciente"]
+        dicc_procesados = log_completo.get("procesados", {})
+        lista_actividad = log_completo.get("actividad_reciente", [])
         
         for index, archivo in enumerate(archivos_cargados):
             nombre_original = archivo.name
@@ -224,7 +228,7 @@ if archivos_cargados:
                         # Pausa de seguridad para que los servidores de Google indexen el archivo
                         time.sleep(2)
                         
-                        # 3. Procesar pasando la referencia de la nube, con timeout elevado a 90 segundos
+                        # 3. Procesar pasando la referencia de la nube, con timeout elevado
                         respuesta = model.generate_content(
                             [archivo_gai, prompt],
                             request_options={"timeout": 90.0}
@@ -235,13 +239,14 @@ if archivos_cargados:
                             
                     except Exception as e_ia:
                         if intento < intentos_maximos - 1:
-                            st.warning(f"⚠️ El intento {intento + 1} para '{nombre_original}' tomó demasiado tiempo o falló. Reintentando...")
-                            time.sleep(3)  
+                            tiempo_espera = 4 * (intento + 1)
+                            st.warning(f"⚠️ El intento {intento + 1} para '{nombre_original}' tomó demasiado tiempo o falló. Reintentando en {tiempo_espera}s...")
+                            time.sleep(tiempo_espera)  
                         else:
-                            raise e_ia  
+                            raise e_ia  # Lanza el error al bloque except principal si agota intentos
                             
                     finally:
-                        # 4. LIMPIEZA OBLIGATORIA: Previene que tu servidor se quede sin espacio
+                        # 4. LIMPIEZA OBLIGATORIA
                         if archivo_gai:
                             try:
                                 archivo_gai.delete()
@@ -253,7 +258,14 @@ if archivos_cargados:
                             except:
                                 pass
                 
-                datos = EsquemaPoliza.model_validate_json(respuesta.text)
+                # Limpieza de la respuesta por si Gemini devuelve Markdown (```json ... ```)
+                texto_limpio = respuesta.text.strip()
+                if texto_limpio.startswith("```json"):
+                    texto_limpio = texto_limpio[7:-3].strip()
+                elif texto_limpio.startswith("```"):
+                    texto_limpio = texto_limpio[3:-3].strip()
+                    
+                datos = EsquemaPoliza.model_validate_json(texto_limpio)
                 
                 if "especificado" in datos.nombres.lower() or "especificado" in datos.numero_poliza.lower():
                     nuevo_nombre = f"[MANUAL] - {nombre_original}".upper()
@@ -281,6 +293,7 @@ if archivos_cargados:
                     "detalle": f"Organizado como: {nuevo_nombre}"
                 })
                 
+                log_completo["procesados"] = dicc_procesados
                 log_completo["actividad_reciente"] = lista_actividad[:40]
                 guardar_log_en_drive(log_completo)
                 
@@ -302,14 +315,18 @@ if archivos_cargados:
                 
             progreso.progress((index + 1) / len(archivos_cargados))
             
+            # Respiración para la API entre pólizas del lote (excepto tras la última)
+            if index < len(archivos_cargados) - 1:
+                time.sleep(4)
+            
         status_text.text("✨ ¡Lote finalizado! Historial de control actualizado en la nube.")
 
-# SECCIÓN DE DESCARGAS ACTUALIZADA CON BOTONES INDIVIDUALES
+# SECCIÓN DE DESCARGAS
 if st.session_state.archivos_listos:
     st.markdown("---")
     st.subheader(f"📦 Resultados listos ({len(st.session_state.archivos_listos)} archivos)")
     
-    # 1. Botón unificado en ZIP (Para todo el lote)
+    # 1. Botón unificado en ZIP
     zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
         for nombre_archivo, contenido_bytes in st.session_state.archivos_listos.items():
@@ -327,7 +344,7 @@ if st.session_state.archivos_listos:
     st.markdown("### 📄 Descargas Individuales")
     st.markdown("Haz clic en cualquier archivo procesado para guardarlo de nuevo con su nombre estructurado:")
     
-    # 2. Generación dinámica de botones de descarga por archivo
+    # 2. Generación dinámica de botones
     for nombre_archivo, contenido_bytes in st.session_state.archivos_listos.items():
         if not nombre_archivo.startswith("[ERROR]"):
             llave_boton = hashlib.md5(nombre_archivo.encode('utf-8')).hexdigest()
