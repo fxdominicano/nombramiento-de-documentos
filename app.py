@@ -40,7 +40,6 @@ def guardar_en_json(nuevo_registro, filepath=JSON_FILE):
         json.dump(historial, f, ensure_ascii=False, indent=4)
     return historial
 
----
 
 # 1. Selector de archivos PDF
 uploaded_file = st.file_uploader("Selecciona un archivo PDF para procesar", type=["pdf"])
@@ -55,9 +54,6 @@ if uploaded_file is not None:
         texto_extraido = primera_pagina.extract_text() or ""
         
         # --- TU LÓGICA DE EXTRACCIÓN (Mantén aquí tus reglas o IA de extracción) ---
-        # Nota: Aquí van tus expresiones regulares actuales para extraer el ramo, sumas, etc.
-        # Colocamos valores de simulación basados en tu estructura estándar:
-        
         nombre_original = uploaded_file.name
         ramo_detectado = "Vehículos" if "VEHÍCULO" in texto_extraido.upper() else "Incendio"
         estatus_proceso = "Correcto"
@@ -71,13 +67,13 @@ if uploaded_file is not None:
         nuevo_nombre_pdf = f"{poliza_id}_{nombre_original.replace('.pdf', '')}_Listo.pdf"
         # ----------------------------------------------------------------------------
 
-        # 3. CREACIÓN DEL OBJETO JSON (Manteniendo tus llaves intactas)
+        # 3. CREACIÓN DEL OBJETO JSON
         datos_procesados = {
             "Archivo": nuevo_nombre_pdf,
             "Ramo": ramo_detectado,
-            "Detalle_Objeto": "Simulación de objeto extraído del PDF", # Reemplazar por tu variable
-            "Sub_Modelo": "N/A",                                      # Reemplazar por tu variable
-            "Suma_Asegurada_RD": 0.00,                                 # Reemplazar por tu variable
+            "Detalle_Objeto": "Simulación de objeto extraído del PDF", 
+            "Sub_Modelo": "N/A",                                      
+            "Suma_Asegurada_RD": 0.00,                                 
             "Estatus": estatus_proceso,
             "Nota_Auditoria": nota_auditoria,
             "Fecha_Analisis": fecha_actual
@@ -107,7 +103,6 @@ if uploaded_file is not None:
             )
             
         with col2:
-            # Opción para descargar también el archivo JSON completo acumulado si estás en la nube
             json_string = json.dumps(historial_actualizado, ensure_ascii=False, indent=4)
             st.download_button(
                 label="📥 Descargar Historial JSON",
