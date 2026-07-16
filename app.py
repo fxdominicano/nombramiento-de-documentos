@@ -15,11 +15,14 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaInMemoryUpload
 
+# IMPORTANTE: Librería para recortar PDFs antes de enviarlos a la IA
+import PyPDF2
+
 # Configuración de la página de Streamlit
 st.set_page_config(page_title="Extractor de Seguros IA", page_icon="🌐", layout="centered")
 
 st.title("🌐 Extractor de Seguros - Nube Sincronizada")
-st.markdown("Procesamiento de pólizas con protección de consumo y registro de actividad en Google Drive.")
+st.markdown("Procesamiento de pólizas ultrarrápido con protección de consumo y registro en Google Drive.")
 
 # 1. CONFIGURACIÓN DE SEGURIDAD Y LLAVES
 if "GEMINI_API_KEY" in st.secrets and "GCP_SERVICE_ACCOUNT" in st.secrets:
@@ -48,7 +51,7 @@ def obtener_servicio_drive():
         
     credenciales = service_account.Credentials.from_service_account_info(
         info_claves, 
-        scopes=["https://www.googleapis.com/auth/drive"]
+        scopes=["[https://www.googleapis.com/auth/drive](https://www.googleapis.com/auth/drive)"]
     )
     return build('drive', 'v3', credentials=credenciales)
 
@@ -191,19 +194,41 @@ if archivos_cargados:
             fecha_hora_accion = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
             
             try:
-                archivo_bytes = archivo.read()
-                hash_archivo = hashlib.sha256(archivo_bytes).hexdigest()
+                # 1. Leemos y conservamos el archivo ORIGINAL COMPLETO (100% de páginas)
+                archivo_bytes_original = archivo.read()
+                hash_archivo = hashlib.sha256(archivo_bytes_original).hexdigest()
                 
                 # Validar si ya se procesó en el pasado
                 if hash_archivo in dicc_procesados:
                     registro = dicc_procesados[hash_archivo]
                     st.info(f"ℹ️ Omitiendo IA para '{nombre_original}'. Recuperado del registro histórico.")
-                    st.session_state.archivos_listos[registro['nombre_nuevo']] = archivo_bytes
+                    st.session_state.archivos_listos[registro['nombre_nuevo']] = archivo_bytes_original
                     progreso.progress((index + 1) / len(archivos_cargados))
                     originales_exitosos.append(nombre_original)
                     continue
                 
+                # 2. RECORTAMOS EL PDF (Solo para la IA)
+                archivo_bytes_ia = archivo_bytes_original
+                if extension == ".pdf":
+                    try:
+                        lector = PyPDF2.PdfReader(io.BytesIO(archivo_bytes_original))
+                        escritor = PyPDF2.PdfWriter()
+                        # Extraemos un máximo de 3 páginas
+                        paginas_a_extraer = min(3, len(lector.pages))
+                        for i in range(paginas_a_extraer):
+                            escritor.add_page(lector.pages[i])
+                            
+                        salida_recortada = io.BytesIO()
+                        escritor.write(salida_recortada)
+                        archivo_bytes_ia = salida_recortada.getvalue()
+                    except Exception as e:
+                        # Si falla el recorte por encriptación, usamos el original
+                        pass
+                
                 mime_type = "application/pdf" if extension == ".pdf" else "image/jpeg"
+                nombre_temporal = f"temp_{hash_archivo}{extension}"
+                intentos_maximos = 2
+                respuesta = None
                 
                 prompt = (
                     "Analiza minuciosamente el documento de seguro. Concéntrate PRINCIPALMENTE en la primera página o carátula. "
@@ -214,26 +239,20 @@ if archivos_cargados:
                     "extrae ESE rango obligatoriamente. No utilices vigencias anuales históricas de páginas secundarias."
                 )
                 
-                intentos_maximos = 2
-                respuesta = None
-                nombre_temporal = f"temp_{hash_archivo}{extension}"
-                
                 for intento in range(intentos_maximos):
                     archivo_gai = None
                     try:
                         status_text.text(f"Analizando póliza ({index + 1}/{len(archivos_cargados)}): {nombre_original} [Intento {intento + 1}]")
                         
-                        # 1. Escribir archivo temporal en disco local
+                        # Guardamos temporalmente el PDF RECORTADO para subirlo rápido
                         with open(nombre_temporal, "wb") as f:
-                            f.write(archivo_bytes)
+                            f.write(archivo_bytes_ia)
                         
-                        # 2. Subir mediante la File API oficial de Google
+                        # Subir mediante la File API oficial de Google
                         archivo_gai = genai.upload_file(path=nombre_temporal, mime_type=mime_type)
-                        
-                        # Pausa de seguridad para que los servidores indexen el archivo
                         time.sleep(2)
                         
-                        # 3. Procesar con timeout elevado
+                        # Procesar pasando la referencia de la nube
                         respuesta = model.generate_content(
                             [archivo_gai, prompt],
                             request_options={"timeout": 90.0}
@@ -245,13 +264,13 @@ if archivos_cargados:
                     except Exception as e_ia:
                         if intento < intentos_maximos - 1:
                             tiempo_espera = 4 * (intento + 1)
-                            st.warning(f"⚠️ El intento {intento + 1} para '{nombre_original}' tomó demasiado tiempo o falló. Reintentando en {tiempo_espera}s...")
+                            st.warning(f"⚠️ El intento {intento + 1} para '{nombre_original}' tomó demasiado tiempo. Reintentando en {tiempo_espera}s...")
                             time.sleep(tiempo_espera)  
                         else:
-                            raise e_ia  # Lanza el error al except principal si agota intentos
+                            raise e_ia
                             
                     finally:
-                        # 4. Limpieza obligatoria
+                        # Limpieza obligatoria del archivo recortado
                         if archivo_gai:
                             try:
                                 archivo_gai.delete()
@@ -284,7 +303,8 @@ if archivos_cargados:
                     nuevo_nombre = cadena_nombre.upper()
                     originales_exitosos.append(nombre_original)
                 
-                st.session_state.archivos_listos[nuevo_nombre] = archivo_bytes
+                # 3. GUARDADO FINAL: Asociamos el nuevo nombre perfecto al PDF ORIGINAL COMPLETO
+                st.session_state.archivos_listos[nuevo_nombre] = archivo_bytes_original
                 
                 dicc_procesados[hash_archivo] = {
                     "nombre_original": nombre_original,
@@ -308,7 +328,8 @@ if archivos_cargados:
             except Exception as e:
                 error_msg = str(e)
                 st.error(f"❌ Error en {nombre_original}: {error_msg}")
-                st.session_state.archivos_listos[f"[ERROR] - {nombre_original}".upper()] = archivo_bytes
+                # En caso de error manual, también guardamos el original completo
+                st.session_state.archivos_listos[f"[ERROR] - {nombre_original}".upper()] = archivo_bytes_original
                 
                 originales_para_revision.append(nombre_original)
                 
