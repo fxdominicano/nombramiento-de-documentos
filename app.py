@@ -181,6 +181,10 @@ if archivos_cargados:
         dicc_procesados = log_completo.get("procesados", {})
         lista_actividad = log_completo.get("actividad_reciente", [])
         
+        # Listas para rastrear qué archivos originales se pueden borrar al final
+        originales_exitosos = []
+        originales_para_revision = []
+        
         for index, archivo in enumerate(archivos_cargados):
             nombre_original = archivo.name
             extension = os.path.splitext(nombre_original)[1].lower()
@@ -196,6 +200,7 @@ if archivos_cargados:
                     st.info(f"ℹ️ Omitiendo IA para '{nombre_original}'. Recuperado del registro histórico.")
                     st.session_state.archivos_listos[registro['nombre_nuevo']] = archivo_bytes
                     progreso.progress((index + 1) / len(archivos_cargados))
+                    originales_exitosos.append(nombre_original)
                     continue
                 
                 mime_type = "application/pdf" if extension == ".pdf" else "image/jpeg"
@@ -218,24 +223,24 @@ if archivos_cargados:
                     try:
                         status_text.text(f"Analizando póliza ({index + 1}/{len(archivos_cargados)}): {nombre_original} [Intento {intento + 1}]")
                         
-                        # 1. Escribir archivo temporal en disco local del servidor Streamlit
+                        # 1. Escribir archivo temporal en disco local
                         with open(nombre_temporal, "wb") as f:
                             f.write(archivo_bytes)
                         
                         # 2. Subir mediante la File API oficial de Google
                         archivo_gai = genai.upload_file(path=nombre_temporal, mime_type=mime_type)
                         
-                        # Pausa de seguridad para que los servidores de Google indexen el archivo
+                        # Pausa de seguridad para que los servidores indexen el archivo
                         time.sleep(2)
                         
-                        # 3. Procesar pasando la referencia de la nube, con timeout elevado
+                        # 3. Procesar con timeout elevado
                         respuesta = model.generate_content(
                             [archivo_gai, prompt],
                             request_options={"timeout": 90.0}
                         )
                         
                         if respuesta:
-                            break  # Éxito en la conexión, salimos del bucle
+                            break  # Éxito en la conexión
                             
                     except Exception as e_ia:
                         if intento < intentos_maximos - 1:
@@ -243,10 +248,10 @@ if archivos_cargados:
                             st.warning(f"⚠️ El intento {intento + 1} para '{nombre_original}' tomó demasiado tiempo o falló. Reintentando en {tiempo_espera}s...")
                             time.sleep(tiempo_espera)  
                         else:
-                            raise e_ia  # Lanza el error al bloque except principal si agota intentos
+                            raise e_ia  # Lanza el error al except principal si agota intentos
                             
                     finally:
-                        # 4. LIMPIEZA OBLIGATORIA
+                        # 4. Limpieza obligatoria
                         if archivo_gai:
                             try:
                                 archivo_gai.delete()
@@ -258,7 +263,7 @@ if archivos_cargados:
                             except:
                                 pass
                 
-                # Limpieza de la respuesta por si Gemini devuelve Markdown (```json ... ```)
+                # Limpieza de Markdown por si Gemini lo devuelve
                 texto_limpio = respuesta.text.strip()
                 if texto_limpio.startswith("```json"):
                     texto_limpio = texto_limpio[7:-3].strip()
@@ -269,14 +274,15 @@ if archivos_cargados:
                 
                 if "especificado" in datos.nombres.lower() or "especificado" in datos.numero_poliza.lower():
                     nuevo_nombre = f"[MANUAL] - {nombre_original}".upper()
+                    originales_para_revision.append(nombre_original)
                 else:
                     f_inicio = corregir_formato_fecha(datos.fecha_inicio)
                     f_fin = corregir_formato_fecha(datos.fecha_fin)
-                    
                     tipo_doc = datos.concepto.strip() if datos.concepto else "DOCUMENTO"
                     
                     cadena_nombre = f"{datos.nombres.strip()} {datos.apellidos.strip()} - PÓLIZA - {tipo_doc} - {datos.numero_poliza.strip()} - vigencia {f_inicio} al {f_fin}{extension}"
                     nuevo_nombre = cadena_nombre.upper()
+                    originales_exitosos.append(nombre_original)
                 
                 st.session_state.archivos_listos[nuevo_nombre] = archivo_bytes
                 
@@ -304,6 +310,8 @@ if archivos_cargados:
                 st.error(f"❌ Error en {nombre_original}: {error_msg}")
                 st.session_state.archivos_listos[f"[ERROR] - {nombre_original}".upper()] = archivo_bytes
                 
+                originales_para_revision.append(nombre_original)
+                
                 lista_actividad.insert(0, {
                     "fecha": fecha_hora_accion,
                     "archivo": nombre_original,
@@ -315,11 +323,34 @@ if archivos_cargados:
                 
             progreso.progress((index + 1) / len(archivos_cargados))
             
-            # Respiración para la API entre pólizas del lote (excepto tras la última)
+            # Respiración para la API entre pólizas
             if index < len(archivos_cargados) - 1:
                 time.sleep(4)
             
         status_text.text("✨ ¡Lote finalizado! Historial de control actualizado en la nube.")
+        
+        # Panel de resumen para identificar qué borrar
+        st.markdown("---")
+        st.subheader("📋 Resumen para limpieza de archivos originales")
+        col_exito, col_fallo = st.columns(2)
+        
+        with col_exito:
+            st.success(f"✅ Listos para eliminar ({len(originales_exitosos)})")
+            if originales_exitosos:
+                st.write("Procesados con éxito. Puedes borrar los siguientes originales:")
+                for doc in originales_exitosos:
+                    st.markdown(f"- `{doc}`")
+            else:
+                st.write("Ningún archivo se procesó limpiamente.")
+                
+        with col_fallo:
+            st.warning(f"⚠️ Requieren tu atención ({len(originales_para_revision)})")
+            if originales_para_revision:
+                st.write("Fallaron o requieren revisión manual. **No los borres aún:**")
+                for doc in originales_para_revision:
+                    st.markdown(f"- `{doc}`")
+            else:
+                st.write("¡Excelente! Ningún archivo falló.")
 
 # SECCIÓN DE DESCARGAS
 if st.session_state.archivos_listos:
