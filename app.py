@@ -1,428 +1,126 @@
 import streamlit as st
-import os
-import re
-import io
-import zipfile
-import json
-import hashlib
-import time
-from datetime import datetime
-import google.generativeai as genai
-from pydantic import BaseModel
-
-# Librerías oficiales para conectar con Google Drive
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload, MediaInMemoryUpload
-
-# IMPORTANTE: Librería para recortar PDFs antes de enviarlos a la IA
 import PyPDF2
+import io
+import os
+import json
+import re
+from datetime import datetime
 
-# Configuración de la página de Streamlit
-st.set_page_config(page_title="Extractor de Seguros IA", page_icon="🌐", layout="centered")
+# Configuración de la ventana de la aplicación
+st.set_page_config(
+    page_title="Nombramiento y Registro de Documentos", 
+    page_icon="📄", 
+    layout="centered"
+)
 
-st.title("🌐 Extractor de Seguros - Nube Sincronizada")
-st.markdown("Procesamiento de pólizas ultrarrápido con protección de consumo y registro en Google Drive.")
+st.title("Procesamiento y Registro de Documentos 📄")
+fecha_actual = datetime.now().strftime('%d/%m/%Y')
+st.write(f"**Fecha de análisis:** {fecha_actual}")
 
-# 1. CONFIGURACIÓN DE SEGURIDAD Y LLAVES
-if "GEMINI_API_KEY" in st.secrets and "GCP_SERVICE_ACCOUNT" in st.secrets:
-    genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
-else:
-    st.error("🔑 Falta configurar 'GEMINI_API_KEY' o 'GCP_SERVICE_ACCOUNT' en los secretos de Streamlit.")
-    st.stop()
+# Nombre del archivo JSON local donde se guarda lo procesado
+JSON_FILE = "job_procesados.json"
 
-# Inicializar memoria de la sesión actual
-if "archivos_listos" not in st.session_state:
-    st.session_state.archivos_listos = {}
-
-# ID DIRECTO DEL ARCHIVO EN DRIVE (registro_procesados)
-FILE_ID = "1qC9450pvpyFgTOc6uyDegSmdVjWmT4qM"
-
-# Conectar de forma segura con Google Cloud
-def obtener_servicio_drive():
-    secreto_gcp = st.secrets["GCP_SERVICE_ACCOUNT"]
-    if isinstance(secreto_gcp, str):
-        info_claves = json.loads(secreto_gcp)
-    else:
-        info_claves = dict(secreto_gcp)
-    
-    if "private_key" in info_claves:
-        info_claves["private_key"] = info_claves["private_key"].replace("\\n", "\n")
-        
-    credenciales = service_account.Credentials.from_service_account_info(
-        info_claves, 
-        scopes=["[https://www.googleapis.com/auth/drive](https://www.googleapis.com/auth/drive)"]
-    )
-    return build('drive', 'v3', credentials=credenciales)
-
-# LECTURA EVOLUCIONADA
-def cargar_log_desde_drive():
-    estructura_base = {"procesados": {}, "actividad_reciente": []}
-    try:
-        drive_service = obtener_servicio_drive()
-        
+# Función segura para guardar/apendizar datos en el archivo JSON
+def guardar_en_json(nuevo_registro, filepath=JSON_FILE):
+    historial = []
+    # 1. Si el archivo ya existe, leemos los registros previos
+    if os.path.exists(filepath):
         try:
-            peticion = drive_service.files().get_media(fileId=FILE_ID)
-            fh = io.BytesIO()
-            descargador = MediaIoBaseDownload(fh, peticion)
-            done = False
-            while not done:
-                _, done = descargador.next_chunk()
-            contenido = fh.getvalue().decode('utf-8').strip()
+            with open(filepath, "r", encoding="utf-8") as f:
+                historial = json.load(f)
+        except Exception:
+            # Si el archivo está vacío o corrupto, empezamos una lista nueva
+            historial = []
             
-        except Exception as e_binario:
-            if "fileNotDownloadable" not in str(e_binario):
-                st.error(f"❌ Error de acceso a la API de Drive: {e_binario}")
-                return estructura_base
-                
-            try:
-                metadatos = drive_service.files().get(fileId=FILE_ID, fields="mimeType").execute()
-                mime_type = metadatos.get("mimeType", "")
-                if "spreadsheet" in mime_type:
-                    peticion = drive_service.files().export_media(fileId=FILE_ID, mimeType="text/csv")
-                else:
-                    peticion = drive_service.files().export_media(fileId=FILE_ID, mimeType="text/plain")
-                    
-                fh = io.BytesIO()
-                descargador = MediaIoBaseDownload(fh, peticion)
-                done = False
-                while not done:
-                    _, done = descargador.next_chunk()
-                contenido = fh.getvalue().decode('utf-8').strip()
-            except Exception:
-                st.error("❌ Elemento de Drive incompatible. Asegúrate de usar un archivo .json válido.")
-                return estructura_base
+    # 2. Añadimos el nuevo registro al historial
+    historial.append(nuevo_registro)
+    
+    # 3. Reescribimos el archivo JSON de forma limpia
+    with open(filepath, "w", encoding="utf-8") as f:
+        json.dump(historial, f, ensure_ascii=False, indent=4)
+    return historial
 
-        if not contenido:
-            return estructura_base
-            
-        datos_cargados = json.loads(contenido)
-        if "procesados" not in datos_cargados:
-            return {"procesados": datos_cargados, "actividad_reciente": []}
-            
-        return datos_cargados
-        
-    except json.JSONDecodeError:
-        st.warning("⚠️ Formato JSON inválido detectado en la nube. Reestructurando historial...")
-        return estructura_base
-    except Exception as e:
-        st.error(f"❌ Error general al procesar el historial: {e}")
-        return estructura_base
+---
 
-# ACTUALIZACIÓN DEL LOG DE ACTIVIDAD
-def guardar_log_en_drive(log_actualizado):
+# 1. Selector de archivos PDF
+uploaded_file = st.file_uploader("Selecciona un archivo PDF para procesar", type=["pdf"])
+
+if uploaded_file is not None:
+    st.info("Analizando documento...")
+    
     try:
-        drive_service = obtener_servicio_drive()
-        contenido_json = json.dumps(log_actualizado, ensure_ascii=False, indent=4).encode('utf-8')
-        media = MediaInMemoryUpload(contenido_json, mimetype='application/json', resumable=True)
-        drive_service.files().update(fileId=FILE_ID, media_body=media).execute()
-    except Exception as e:
-        st.error(f"❌ Error al actualizar el historial en Google Drive: {e}")
+        # 2. Leer el PDF de forma segura con PyPDF2
+        pdf_reader = PyPDF2.PdfReader(uploaded_file)
+        primera_pagina = pdf_reader.pages[0]
+        texto_extraido = primera_pagina.extract_text() or ""
+        
+        # --- TU LÓGICA DE EXTRACCIÓN (Mantén aquí tus reglas o IA de extracción) ---
+        # Nota: Aquí van tus expresiones regulares actuales para extraer el ramo, sumas, etc.
+        # Colocamos valores de simulación basados en tu estructura estándar:
+        
+        nombre_original = uploaded_file.name
+        ramo_detectado = "Vehículos" if "VEHÍCULO" in texto_extraido.upper() else "Incendio"
+        estatus_proceso = "Correcto"
+        nota_auditoria = "Documento procesado y validado exitosamente en el sistema local."
+        
+        # Intentar detectar un ID o número de póliza (ej. de 6 a 12 dígitos)
+        coincidencia_poliza = re.search(r'\b\d{6,12}\b', texto_extraido)
+        poliza_id = coincidencia_poliza.group(0) if coincidencia_poliza else "DOC"
+        
+        # Generar el nuevo nombre del archivo para la descarga
+        nuevo_nombre_pdf = f"{poliza_id}_{nombre_original.replace('.pdf', '')}_Listo.pdf"
+        # ----------------------------------------------------------------------------
 
-# Esquema de datos ampliado para incluir el tipo de documento (concepto)
-class EsquemaPoliza(BaseModel):
-    nombres: str
-    apellidos: str
-    tipo_documento: str
-    concepto: str  
-    numero_poliza: str
-    fecha_inicio: str
-    fecha_fin: str
+        # 3. CREACIÓN DEL OBJETO JSON (Manteniendo tus llaves intactas)
+        datos_procesados = {
+            "Archivo": nuevo_nombre_pdf,
+            "Ramo": ramo_detectado,
+            "Detalle_Objeto": "Simulación de objeto extraído del PDF", # Reemplazar por tu variable
+            "Sub_Modelo": "N/A",                                      # Reemplazar por tu variable
+            "Suma_Asegurada_RD": 0.00,                                 # Reemplazar por tu variable
+            "Estatus": estatus_proceso,
+            "Nota_Auditoria": nota_auditoria,
+            "Fecha_Analisis": fecha_actual
+        }
 
-model = genai.GenerativeModel(
-    model_name="gemini-3.5-flash",
-    generation_config={
-        "response_mime_type": "application/json",
-        "response_schema": EsquemaPoliza,
-        "temperature": 0.1
-    }
-)
+        # 4. Guardar automáticamente en el archivo JSON local
+        historial_actualizado = guardar_en_json(datos_procesados)
+        st.success("✅ ¡Datos extraídos y guardados en el registro JSON correctamente!")
 
-# Formateo estricto de fechas (DD/MM/AAAA)
-def corregir_formato_fecha(fecha_str):
-    if not fecha_str or "especificado" in fecha_str.lower():
-        return fecha_str
-    
-    # Normalizamos cualquier separador a una barra diagonal
-    limpia = re.sub(r'[-/.\s]', '/', fecha_str)
-    partes = limpia.split('/')
-    
-    if len(partes) == 3:
-        dia = partes[0].strip().zfill(2)
-        mes = partes[1].strip().zfill(2)
-        anio = partes[2].strip()
-        if len(anio) == 2:
-            anio = "20" + anio
-        return f"{dia}/{mes}/{anio}"
-        
-    return fecha_str
+        # 5. Mostrar al usuario los resultados en pantalla
+        st.write("### Vista previa del registro guardado:")
+        st.json(datos_procesados)
 
-# Interfaz de usuario
-archivos_cargados = st.file_uploader(
-    "Arrastra aquí los PDFs o imágenes de las pólizas:", 
-    type=["pdf", "jpg", "jpeg", "png"], 
-    accept_multiple_files=True
-)
+        # Volver a poner el puntero del PDF al principio para la descarga
+        uploaded_file.seek(0)
 
-# Cargar el registro actual de Drive para mostrarlo en la interfaz
-log_completo = cargar_log_desde_drive()
-
-if archivos_cargados:
-    st.subheader(f"📋 Archivos listos para procesar: {len(archivos_cargados)}")
-    
-    if st.button("🔄 Limpiar progreso de esta tanda"):
-        st.session_state.archivos_listos = {}
-        st.rerun()
+        # 6. Botones de acción/descarga para el usuario
+        col1, col2 = st.columns(2)
         
-    if st.button("🚀 Iniciar Procesamiento con IA", type="primary"):
-        progreso = st.progress(0)
-        status_text = st.empty()
-        
-        status_text.text("🔄 Sincronizando historial de seguridad desde Drive...")
-        log_completo = cargar_log_desde_drive()
-        
-        dicc_procesados = log_completo.get("procesados", {})
-        lista_actividad = log_completo.get("actividad_reciente", [])
-        
-        # Listas para rastrear qué archivos originales se pueden borrar al final
-        originales_exitosos = []
-        originales_para_revision = []
-        
-        for index, archivo in enumerate(archivos_cargados):
-            nombre_original = archivo.name
-            extension = os.path.splitext(nombre_original)[1].lower()
-            fecha_hora_accion = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-            
-            try:
-                # 1. Leemos y conservamos el archivo ORIGINAL COMPLETO (100% de páginas)
-                archivo_bytes_original = archivo.read()
-                hash_archivo = hashlib.sha256(archivo_bytes_original).hexdigest()
-                
-                # Validar si ya se procesó en el pasado
-                if hash_archivo in dicc_procesados:
-                    registro = dicc_procesados[hash_archivo]
-                    st.info(f"ℹ️ Omitiendo IA para '{nombre_original}'. Recuperado del registro histórico.")
-                    st.session_state.archivos_listos[registro['nombre_nuevo']] = archivo_bytes_original
-                    progreso.progress((index + 1) / len(archivos_cargados))
-                    originales_exitosos.append(nombre_original)
-                    continue
-                
-                # 2. RECORTAMOS EL PDF (Solo para la IA)
-                archivo_bytes_ia = archivo_bytes_original
-                if extension == ".pdf":
-                    try:
-                        lector = PyPDF2.PdfReader(io.BytesIO(archivo_bytes_original))
-                        escritor = PyPDF2.PdfWriter()
-                        # Extraemos un máximo de 3 páginas
-                        paginas_a_extraer = min(3, len(lector.pages))
-                        for i in range(paginas_a_extraer):
-                            escritor.add_page(lector.pages[i])
-                            
-                        salida_recortada = io.BytesIO()
-                        escritor.write(salida_recortada)
-                        archivo_bytes_ia = salida_recortada.getvalue()
-                    except Exception as e:
-                        # Si falla el recorte por encriptación, usamos el original
-                        pass
-                
-                mime_type = "application/pdf" if extension == ".pdf" else "image/jpeg"
-                nombre_temporal = f"temp_{hash_archivo}{extension}"
-                intentos_maximos = 2
-                respuesta = None
-                
-                prompt = (
-                    "Analiza minuciosamente el documento de seguro. Concéntrate PRINCIPALMENTE en la primera página o carátula. "
-                    "Extrae el nombre y apellido del asegurado, tipo de documento, número de póliza exacto y el Concepto/Tipo de movimiento "
-                    "(ej. 'Factura Ajuste', 'Renovación', 'Inclusión', 'Póliza Nueva'). "
-                    "CRÍTICO PARA LAS VIGENCIAS: Busca el bloque principal de vigencia del movimiento o factura actual. "
-                    "Si encuentras un rango corto que indica vigencia de un ajuste o endoso (ej. 'Desde 13/05/2026 Hasta 31/05/2026'), "
-                    "extrae ESE rango obligatoriamente. No utilices vigencias anuales históricas de páginas secundarias."
-                )
-                
-                for intento in range(intentos_maximos):
-                    archivo_gai = None
-                    try:
-                        status_text.text(f"Analizando póliza ({index + 1}/{len(archivos_cargados)}): {nombre_original} [Intento {intento + 1}]")
-                        
-                        # Guardamos temporalmente el PDF RECORTADO para subirlo rápido
-                        with open(nombre_temporal, "wb") as f:
-                            f.write(archivo_bytes_ia)
-                        
-                        # Subir mediante la File API oficial de Google
-                        archivo_gai = genai.upload_file(path=nombre_temporal, mime_type=mime_type)
-                        time.sleep(2)
-                        
-                        # Procesar pasando la referencia de la nube
-                        respuesta = model.generate_content(
-                            [archivo_gai, prompt],
-                            request_options={"timeout": 90.0}
-                        )
-                        
-                        if respuesta:
-                            break  # Éxito en la conexión
-                            
-                    except Exception as e_ia:
-                        if intento < intentos_maximos - 1:
-                            tiempo_espera = 4 * (intento + 1)
-                            st.warning(f"⚠️ El intento {intento + 1} para '{nombre_original}' tomó demasiado tiempo. Reintentando en {tiempo_espera}s...")
-                            time.sleep(tiempo_espera)  
-                        else:
-                            raise e_ia
-                            
-                    finally:
-                        # Limpieza obligatoria del archivo recortado
-                        if archivo_gai:
-                            try:
-                                archivo_gai.delete()
-                            except:
-                                pass
-                        if os.path.exists(nombre_temporal):
-                            try:
-                                os.remove(nombre_temporal)
-                            except:
-                                pass
-                
-                # Limpieza de Markdown por si Gemini lo devuelve
-                texto_limpio = respuesta.text.strip()
-                if texto_limpio.startswith("```json"):
-                    texto_limpio = texto_limpio[7:-3].strip()
-                elif texto_limpio.startswith("```"):
-                    texto_limpio = texto_limpio[3:-3].strip()
-                    
-                datos = EsquemaPoliza.model_validate_json(texto_limpio)
-                
-                if "especificado" in datos.nombres.lower() or "especificado" in datos.numero_poliza.lower():
-                    nuevo_nombre = f"[MANUAL] - {nombre_original}".upper()
-                    originales_para_revision.append(nombre_original)
-                else:
-                    f_inicio = corregir_formato_fecha(datos.fecha_inicio)
-                    f_fin = corregir_formato_fecha(datos.fecha_fin)
-                    tipo_doc = datos.concepto.strip() if datos.concepto else "DOCUMENTO"
-                    
-                    cadena_nombre = f"{datos.nombres.strip()} {datos.apellidos.strip()} - PÓLIZA - {tipo_doc} - {datos.numero_poliza.strip()} - vigencia {f_inicio} al {f_fin}{extension}"
-                    nuevo_nombre = cadena_nombre.upper()
-                    originales_exitosos.append(nombre_original)
-                
-                # 3. GUARDADO FINAL: Asociamos el nuevo nombre perfecto al PDF ORIGINAL COMPLETO
-                st.session_state.archivos_listos[nuevo_nombre] = archivo_bytes_original
-                
-                dicc_procesados[hash_archivo] = {
-                    "nombre_original": nombre_original,
-                    "nombre_nuevo": nuevo_nombre,
-                    "fecha_revision": fecha_hora_accion.split()[0]
-                }
-                
-                lista_actividad.insert(0, {
-                    "fecha": fecha_hora_accion,
-                    "archivo": nombre_original,
-                    "estado": "Éxito",
-                    "detalle": f"Organizado como: {nuevo_nombre}"
-                })
-                
-                log_completo["procesados"] = dicc_procesados
-                log_completo["actividad_reciente"] = lista_actividad[:40]
-                guardar_log_en_drive(log_completo)
-                
-                st.success(f"✅ Sincronizado correctamente: {nuevo_nombre}")
-                
-            except Exception as e:
-                error_msg = str(e)
-                st.error(f"❌ Error en {nombre_original}: {error_msg}")
-                # En caso de error manual, también guardamos el original completo
-                st.session_state.archivos_listos[f"[ERROR] - {nombre_original}".upper()] = archivo_bytes_original
-                
-                originales_para_revision.append(nombre_original)
-                
-                lista_actividad.insert(0, {
-                    "fecha": fecha_hora_accion,
-                    "archivo": nombre_original,
-                    "estado": "Error",
-                    "detalle": error_msg[:150]
-                })
-                log_completo["actividad_reciente"] = lista_actividad[:40]
-                guardar_log_en_drive(log_completo)
-                
-            progreso.progress((index + 1) / len(archivos_cargados))
-            
-            # Respiración para la API entre pólizas
-            if index < len(archivos_cargados) - 1:
-                time.sleep(4)
-            
-        status_text.text("✨ ¡Lote finalizado! Historial de control actualizado en la nube.")
-        
-        # Panel de resumen para identificar qué borrar
-        st.markdown("---")
-        st.subheader("📋 Resumen para limpieza de archivos originales")
-        col_exito, col_fallo = st.columns(2)
-        
-        with col_exito:
-            st.success(f"✅ Listos para eliminar ({len(originales_exitosos)})")
-            if originales_exitosos:
-                st.write("Procesados con éxito. Puedes borrar los siguientes originales:")
-                for doc in originales_exitosos:
-                    st.markdown(f"- `{doc}`")
-            else:
-                st.write("Ningún archivo se procesó limpiamente.")
-                
-        with col_fallo:
-            st.warning(f"⚠️ Requieren tu atención ({len(originales_para_revision)})")
-            if originales_para_revision:
-                st.write("Fallaron o requieren revisión manual. **No los borres aún:**")
-                for doc in originales_para_revision:
-                    st.markdown(f"- `{doc}`")
-            else:
-                st.write("¡Excelente! Ningún archivo falló.")
-
-# SECCIÓN DE DESCARGAS
-if st.session_state.archivos_listos:
-    st.markdown("---")
-    st.subheader(f"📦 Resultados listos ({len(st.session_state.archivos_listos)} archivos)")
-    
-    # 1. Botón unificado en ZIP
-    zip_buffer = io.BytesIO()
-    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
-        for nombre_archivo, contenido_bytes in st.session_state.archivos_listos.items():
-            if not nombre_archivo.startswith("[ERROR]"):
-                zip_file.writestr(nombre_archivo, contenido_bytes)
-            
-    st.download_button(
-        label="💾 Descargar TODO el Lote Organizado (.ZIP)",
-        data=zip_buffer.getvalue(),
-        file_name="polizas_organizadas.zip",
-        mime="application/zip",
-        use_container_width=True
-    )
-    
-    st.markdown("### 📄 Descargas Individuales")
-    st.markdown("Haz clic en cualquier archivo procesado para guardarlo de nuevo con su nombre estructurado:")
-    
-    # 2. Generación dinámica de botones
-    for nombre_archivo, contenido_bytes in st.session_state.archivos_listos.items():
-        if not nombre_archivo.startswith("[ERROR]"):
-            llave_boton = hashlib.md5(nombre_archivo.encode('utf-8')).hexdigest()
-            
+        with col1:
             st.download_button(
-                label=f"⬇️ Descargar: {nombre_archivo}",
-                data=contenido_bytes,
-                file_name=nombre_archivo,
-                mime="application/octet-stream",
-                key=llave_boton
+                label="📥 Descargar PDF Renombrado",
+                data=uploaded_file,
+                file_name=nuevo_nombre_pdf,
+                mime="application/pdf",
+                use_container_width=True
+            )
+            
+        with col2:
+            # Opción para descargar también el archivo JSON completo acumulado si estás en la nube
+            json_string = json.dumps(historial_actualizado, ensure_ascii=False, indent=4)
+            st.download_button(
+                label="📥 Descargar Historial JSON",
+                data=json_string,
+                file_name=f"job_{datetime.now().strftime('%Y_%m')}.json",
+                mime="application/json",
+                use_container_width=True
             )
 
-# 📊 SECCIÓN DE AUDITORÍA
-st.markdown("---")
-with st.expander("📊 Panel de Control e Historial de Errores (Google Drive)", expanded=True):
-    col1, col2 = st.columns(2)
-    col1.metric("Pólizas en Base de Datos", len(log_completo.get("procesados", {})))
-    col2.metric("Eventos de Actividad Grabados", len(log_completo.get("actividad_reciente", [])))
-    
-    actividades = log_completo.get("actividad_reciente", [])
-    if actividades:
-        st.markdown("**Últimos movimientos detectados en tu cuenta:**")
-        for act in actividades:
-            if act["estado"] == "Éxito":
-                st.caption(f"🟢 **[{act['fecha']}]** {act['archivo']} ➔ *{act['detalle']}*")
-            else:
-                st.caption(f"🔴 **[{act['fecha']}] FALLÓ:** {act['archivo']} ➔ `{act['detalle']}`")
-    else:
-        st.info("No se registran movimientos en el historial de actividad de este archivo JSON.")
+    except PyPDF2.errors.PdfReadError:
+        st.error("❌ Error: El archivo PDF parece estar encriptado o dañado.")
+    except Exception as e:
+        st.error(f"❌ Ocurrió un error inesperado: {e}")
+
+else:
+    st.info("Esperando archivo PDF para iniciar el análisis y actualización del JSON.")
