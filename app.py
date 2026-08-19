@@ -11,7 +11,7 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaInMemoryUpload, MediaIoBaseDownload
 import google.generativeai as genai
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import streamlit as st
 
 # Configuración de la página de Streamlit
@@ -142,15 +142,31 @@ def guardar_log_en_drive(log_actualizado):
         st.error(f"❌ Error al actualizar el historial en Google Drive: {e}")
 
 
-# Esquema de datos ampliado para incluir el tipo de documento (concepto)
+# 2. ESQUEMA ROBUSTO (Manejo de empresas y valores nulos)
 class EsquemaPoliza(BaseModel):
-    nombres: str
-    apellidos: str
-    tipo_documento: str
-    concepto: str
-    numero_poliza: str
-    fecha_inicio: str
-    fecha_fin: str
+    nombres: str = Field(
+        default="",
+        description="Nombre del asegurado o Razón Social completa de la empresa",
+    )
+    apellidos: str = Field(
+        default="",
+        description="Apellidos del asegurado (dejar vacío si es una empresa/razón social)",
+    )
+    tipo_documento: str = Field(
+        default="DOCUMENTO", description="Tipo de documento o ramo"
+    )
+    concepto: str = Field(
+        default="PÓLIZA", description="Concepto o movimiento (ej. Renovación)"
+    )
+    numero_poliza: str = Field(
+        default="SIN_NUMERO", description="Número de póliza exacto"
+    )
+    fecha_inicio: str = Field(
+        default="", description="Fecha de inicio de vigencia"
+    )
+    fecha_fin: str = Field(
+        default="", description="Fecha de fin de vigencia"
+    )
 
 
 # Modelo Gemini fijado
@@ -164,19 +180,21 @@ model = genai.GenerativeModel(
 )
 
 
-# Formateo estricto de fechas (dd.MM.AAAA)
+# 3. FORMATEO DE FECHA (DD/MM/AAAA)
 def corregir_formato_fecha(fecha_str):
     if not fecha_str or "especificado" in fecha_str.lower():
         return fecha_str
-    limpia = re.sub(r"[-/\s]", ".", fecha_str)
-    partes = limpia.split(".")
+    # Limpiamos delimitadores comunes para estandarizar
+    limpia = re.sub(r"[-/\.\s]", "/", fecha_str)
+    partes = [p for p in limpia.split("/") if p.strip()]
+    
     if len(partes) == 3:
         dia = partes[0].strip().zfill(2)
         mes = partes[1].strip().zfill(2)
         anio = partes[2].strip()
         if len(anio) == 2:
             anio = "20" + anio
-        return f"{dia}.{mes}.{anio}"
+        return f"{dia}/{mes}/{anio}"
     return fecha_str
 
 
@@ -206,8 +224,8 @@ if archivos_cargados:
         )
         log_completo = cargar_log_desde_drive()
 
-        dicc_procesados = log_completo["procesados"]
-        lista_actividad = log_completo["actividad_reciente"]
+        dicc_procesados = log_completo.get("procesados", {})
+        lista_actividad = log_completo.get("actividad_reciente", [])
 
         for index, archivo in enumerate(archivos_cargados):
             nombre_original = archivo.name
@@ -236,15 +254,16 @@ if archivos_cargados:
                     else "image/jpeg"
                 )
 
+                # 4. PROMPT ACTUALIZADO PARA EMPRESAS
                 prompt = (
-                    "Analiza minuciosamente el documento de seguro. Extrae el nombre y apellido del asegurado, "
-                    "tipo de documento, número de póliza exacto y el Concepto/Tipo de movimiento (ej. 'Factura Ajuste', "
-                    "'Renovación', 'Inclusión', 'Póliza Nueva'). "
-                    "CRÍTICO PARA LAS VIGENCIAS: Busca el bloque principal de vigencia del movimiento o factura actual "
-                    "(usualmente en la primera página o cabecera, junto a los datos del caso). "
-                    "Si encuentras un rango corto que indica vigencia de un ajuste o endoso (ej. 'Desde 13/05/2026 Hasta 31/05/2026'), "
-                    "extrae ESE rango obligatoriamente. No utilices vigencias anuales históricas de páginas secundarias "
-                    "si difieren de la vigencia del documento principal de la carátula."
+                    "Analiza minuciosamente el documento de seguro y extrae los datos requeridos.\n"
+                    "- Si el asegurado es una PERSONA JURÍDICA / EMPRESA (ej. 'FARMACIA PUJOLS SRL'), "
+                    "coloca la razón social completa en 'nombres' y deja 'apellidos' vacío.\n"
+                    "- Extrae el concepto/tipo de movimiento (ej. 'Factura Ajuste', 'Renovación', 'Inclusión', 'Póliza Nueva').\n"
+                    "- Extrae el número de póliza exacto.\n"
+                    "- CRÍTICO PARA LAS VIGENCIAS: Extrae la vigencia del movimiento o factura actual "
+                    "(usualmente en la primera página). No utilices vigencias anuales históricas de páginas secundarias.\n"
+                    "- Si algún dato no se encuentra, devuelve un string vacío ('') en ese campo, NUNCA omitas las claves."
                 )
 
                 # Control de reintentos con pausa progresiva
@@ -276,6 +295,7 @@ if archivos_cargados:
                         else:
                             raise e_ia
 
+                # Validar la respuesta con Pydantic
                 datos = EsquemaPoliza.model_validate_json(respuesta.text)
 
                 if (
@@ -284,8 +304,13 @@ if archivos_cargados:
                 ):
                     nuevo_nombre = f"[MANUAL] - {nombre_original}".upper()
                 else:
+                    # Formateo de las fechas (DD/MM/AAAA)
                     f_inicio = corregir_formato_fecha(datos.fecha_inicio)
                     f_fin = corregir_formato_fecha(datos.fecha_fin)
+                    
+                    # Para el nombre del archivo reemplazamos '/' por '-' para evitar errores de guardado en el OS
+                    f_inicio_file = f_inicio.replace("/", "-") if f_inicio else "SIN_FECHA"
+                    f_fin_file = f_fin.replace("/", "-") if f_fin else "SIN_FECHA"
 
                     tipo_doc = (
                         datos.concepto.strip()
@@ -293,8 +318,15 @@ if archivos_cargados:
                         else "DOCUMENTO"
                     )
 
-                    cadena_nombre = f"{datos.nombres.strip()} {datos.apellidos.strip()} - PÓLIZA - {tipo_doc} - {datos.numero_poliza.strip()} - vigencia {f_inicio} al {f_fin}{extension}"
-                    nuevo_nombre = cadena_nombre.upper()
+                    # 5. LIMPIEZA DEL NOMBRE (Evita doble espacio si no hay apellidos)
+                    nombre_completo = f"{datos.nombres.strip()} {datos.apellidos.strip()}".strip()
+                    if not nombre_completo:
+                        nombre_completo = "ASEGURADO NO ESPECIFICADO"
+
+                    cadena_nombre = f"{nombre_completo} - PÓLIZA - {tipo_doc} - {datos.numero_poliza.strip()} - vigencia ({f_inicio_file}) al ({f_fin_file}){extension}"
+                    
+                    # Remover espacios dobles accidentales generados por la concatenación
+                    nuevo_nombre = re.sub(r"\s+", " ", cadena_nombre).upper()
 
                 st.session_state.archivos_listos[nuevo_nombre] = archivo_bytes
 
@@ -315,6 +347,7 @@ if archivos_cargados:
                     },
                 )
 
+                log_completo["procesados"] = dicc_procesados
                 log_completo["actividad_reciente"] = lista_actividad[:40]
                 guardar_log_en_drive(log_completo)
 
