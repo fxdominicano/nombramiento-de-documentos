@@ -155,7 +155,7 @@ class EsquemaPoliza(typing.TypedDict):
 
 # Modelo Gemini
 model = genai.GenerativeModel(
-    model_name="gemini-3.7-flash",
+    model_name="gemini-3.8-flash",
     generation_config={
         "response_mime_type": "application/json",
         "response_schema": EsquemaPoliza,
