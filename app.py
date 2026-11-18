@@ -37,6 +37,9 @@ else:
 if "archivos_listos" not in st.session_state:
     st.session_state.archivos_listos = {}
 
+if "archivos_con_error" not in st.session_state:
+    st.session_state.archivos_con_error = {}
+
 # ID DIRECTO DEL ARCHIVO EN DRIVE (registro_procesados)
 FILE_ID = "1qC9450pvpyFgTOc6uyDegSmdVjWmT4qM"
 
@@ -57,7 +60,7 @@ def obtener_servicio_drive():
     credenciales = service_account.Credentials.from_service_account_info(
         info_claves, scopes=["https://www.googleapis.com/auth/drive"]
     )
-    return build("drive", "v3", credentials=credenciales)
+    return build("drive", "v3", credentials=credenciales, cache_discovery=False)
 
 
 # LECTURA EVOLUCIONADA
@@ -127,19 +130,29 @@ def cargar_log_desde_drive():
         return estructura_base
 
 
-# ACTUALIZACIÓN DEL LOG DE ACTIVIDAD
+# ACTUALIZACIÓN DEL LOG DE ACTIVIDAD CON REINTENTO DE RED
 def guardar_log_en_drive(log_actualizado):
-    try:
-        drive_service = obtener_servicio_drive()
-        contenido_json = json.dumps(
-            log_actualizado, ensure_ascii=False, indent=4
-        ).encode("utf-8")
-        media = MediaInMemoryUpload(
-            contenido_json, mimetype="application/json", resumable=True
-        )
-        drive_service.files().update(fileId=FILE_ID, media_body=media).execute()
-    except Exception as e:
-        st.error(f"❌ Error al actualizar el historial en Google Drive: {e}")
+    contenido_json = json.dumps(
+        log_actualizado, ensure_ascii=False, indent=4
+    ).encode("utf-8")
+
+    for intento_drive in range(2):
+        try:
+            drive_service = obtener_servicio_drive()
+            media = MediaInMemoryUpload(
+                contenido_json, mimetype="application/json", resumable=True
+            )
+            drive_service.files().update(
+                fileId=FILE_ID, media_body=media
+            ).execute()
+            return
+        except Exception as e:
+            if intento_drive == 0:
+                time.sleep(2)
+            else:
+                st.error(
+                    f"❌ Error al actualizar el historial en Google Drive: {e}"
+                )
 
 
 # Esquema nativo compatible 100% con Google Generative AI (TypedDict)
@@ -153,14 +166,22 @@ class EsquemaPoliza(typing.TypedDict):
     fecha_fin: str
 
 
-# Modelo Gemini
-model = genai.GenerativeModel(
+# Configuración compartida de generación
+config_generacion = {
+    "response_mime_type": "application/json",
+    "response_schema": EsquemaPoliza,
+    "temperature": 0.1,
+}
+
+# Modelo principal (máxima precisión) y modelo de respaldo (contingencia ante 504)
+modelo_principal = genai.GenerativeModel(
     model_name="gemini-3.8-flash",
-    generation_config={
-        "response_mime_type": "application/json",
-        "response_schema": EsquemaPoliza,
-        "temperature": 0.1,
-    },
+    generation_config=config_generacion,
+)
+
+modelo_respaldo = genai.GenerativeModel(
+    model_name="gemini-3.7-flash",
+    generation_config=config_generacion,
 )
 
 
@@ -180,6 +201,199 @@ def corregir_formato_fecha(fecha_str):
     return fecha_str
 
 
+# Limpieza preventiva de bloques Markdown en respuestas JSON
+def limpiar_respuesta_json(texto_respuesta):
+    texto = texto_respuesta.strip()
+    if texto.startswith("```"):
+        texto = re.sub(r"^```(?:json)?\s*", "", texto)
+        texto = re.sub(r"\s*```$", "", texto)
+    return texto.strip()
+
+
+# MOTOR UNIFICADO DE PROCESAMIENTO (LOTE INICIAL Y REINTENTOS)
+def procesar_lote_documentos(lista_documentos, es_reintento=False):
+    progreso = st.progress(0)
+    status_text = st.empty()
+
+    status_text.text("🔄 Sincronizando historial de seguridad desde Drive...")
+    log_actual = cargar_log_desde_drive()
+
+    dicc_procesados = log_actual["procesados"]
+    lista_actividad = log_actual["actividad_reciente"]
+    total_docs = len(lista_documentos)
+
+    prompt = (
+        "Analiza minuciosamente el documento de seguro y extrae los datos requeridos.\n"
+        "- Si el asegurado es una PERSONA JURÍDICA / EMPRESA (ej. 'FARMACIA PUJOLS SRL'), coloca la razón social completa en 'nombres' y deja 'apellidos' como cadena vacía ('').\n"
+        "- Extrae el concepto/tipo de movimiento (ej. 'Factura Ajuste', 'Renovación', 'Inclusión', 'Póliza Nueva', 'Incendio y Líneas Aliadas').\n"
+        "- Extrae el número de póliza exacto.\n"
+        "- VIGENCIAS: Extrae la vigencia del movimiento o factura actual (ej. '13/05/2026' a '31/05/2026'). No utilices vigencias anuales históricas de páginas secundarias si difieren de la principal.\n"
+        "- Si algún dato no se encuentra en el documento, devuelve una cadena vacía ('') en ese campo, pero NUNCA omitas las claves del JSON."
+    )
+
+    for index, doc in enumerate(lista_documentos):
+        nombre_original = doc["nombre_original"]
+        archivo_bytes = doc["bytes"]
+        clave_error = f"[ERROR] - {nombre_original}".upper()
+        extension = os.path.splitext(nombre_original)[1].lower()
+        fecha_hora_accion = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+
+        try:
+            hash_archivo = hashlib.sha256(archivo_bytes).hexdigest()
+
+            # Validar si ya se procesó en el pasado
+            if hash_archivo in dicc_procesados:
+                registro = dicc_procesados[hash_archivo]
+                st.info(
+                    f"ℹ️ Omitiendo IA para '{nombre_original}'. Recuperado del registro histórico."
+                )
+                st.session_state.archivos_listos[registro["nombre_nuevo"]] = (
+                    archivo_bytes
+                )
+                # Limpiar rastro de error si venía de un reintento
+                st.session_state.archivos_listos.pop(clave_error, None)
+                st.session_state.archivos_con_error.pop(clave_error, None)
+                progreso.progress((index + 1) / total_docs)
+                continue
+
+            # Asignación exacta de MIME type según extensión
+            if extension == ".pdf":
+                mime_type = "application/pdf"
+            elif extension == ".png":
+                mime_type = "image/png"
+            else:
+                mime_type = "image/jpeg"
+
+            # Control de reintentos con timeout extendido y respaldo automático
+            intentos_maximos = 3
+            tiempos_espera = [8, 15]
+            respuesta = None
+
+            for intento in range(intentos_maximos):
+                try:
+                    modelo_actual = (
+                        modelo_principal if intento < 2 else modelo_respaldo
+                    )
+                    nombre_modelo = (
+                        "3.8-Flash"
+                        if intento < 2
+                        else "3.7-Flash (Respaldo)"
+                    )
+                    timeout_actual = 120.0 if intento == 0 else 180.0
+
+                    etiqueta_modo = "Reintentando" if es_reintento else "Analizando"
+                    status_text.text(
+                        f"{etiqueta_modo} póliza ({index + 1}/{total_docs}): "
+                        f"{nombre_original} [Intento {intento + 1} - {nombre_modelo}]"
+                    )
+
+                    respuesta = modelo_actual.generate_content(
+                        [
+                            {"mime_type": mime_type, "data": archivo_bytes},
+                            prompt,
+                        ],
+                        request_options={"timeout": timeout_actual},
+                    )
+                    if respuesta and respuesta.text:
+                        break
+                except Exception as e_ia:
+                    if intento < intentos_maximos - 1:
+                        espera = tiempos_espera[intento]
+                        st.warning(
+                            f"⚠️ Reintento {intento + 1} para '{nombre_original}' "
+                            f"tras pausa de {espera}s por respuesta tardía o cuota de API..."
+                        )
+                        time.sleep(espera)
+                    else:
+                        raise e_ia
+
+            # Parseo seguro con limpieza preventiva y valores por defecto
+            texto_limpio = limpiar_respuesta_json(respuesta.text)
+            datos = json.loads(texto_limpio)
+            nombres = str(datos.get("nombres", "") or "").strip()
+            apellidos = str(datos.get("apellidos", "") or "").strip()
+            concepto = str(datos.get("concepto", "") or "").strip()
+            numero_poliza = str(datos.get("numero_poliza", "") or "").strip()
+            fecha_inicio = str(datos.get("fecha_inicio", "") or "").strip()
+            fecha_fin = str(datos.get("fecha_fin", "") or "").strip()
+
+            if (
+                "especificado" in nombres.lower()
+                or "especificado" in numero_poliza.lower()
+                or (not nombres and not apellidos)
+            ):
+                nuevo_nombre = f"[MANUAL] - {nombre_original}".upper()
+            else:
+                f_inicio = corregir_formato_fecha(fecha_inicio)
+                f_fin = corregir_formato_fecha(fecha_fin)
+                tipo_doc = concepto if concepto else "DOCUMENTO"
+                nombre_completo = f"{nombres} {apellidos}".strip()
+
+                cadena_nombre = f"{nombre_completo} - PÓLIZA - {tipo_doc} - {numero_poliza} - vigencia {f_inicio} al {f_fin}{extension}"
+                nuevo_nombre = re.sub(r"\s+", " ", cadena_nombre).upper()
+
+            # Guardar resultado exitoso y eliminar cualquier marca de error previa
+            st.session_state.archivos_listos.pop(clave_error, None)
+            st.session_state.archivos_con_error.pop(clave_error, None)
+            st.session_state.archivos_listos[nuevo_nombre] = archivo_bytes
+
+            # Registrar éxito en Google Drive
+            dicc_procesados[hash_archivo] = {
+                "nombre_original": nombre_original,
+                "nombre_nuevo": nuevo_nombre,
+                "fecha_revision": fecha_hora_accion.split()[0],
+            }
+
+            lista_actividad.insert(
+                0,
+                {
+                    "fecha": fecha_hora_accion,
+                    "archivo": nombre_original,
+                    "estado": "Éxito",
+                    "detalle": f"Organizado como: {nuevo_nombre}",
+                },
+            )
+
+            log_actual["actividad_reciente"] = lista_actividad[:40]
+            guardar_log_en_drive(log_actual)
+
+            st.success(f"✅ Sincronizado correctamente: {nuevo_nombre}")
+
+            if index < total_docs - 1:
+                time.sleep(1)
+
+        except Exception as e:
+            error_msg = str(e)
+            st.error(f"❌ Error en {nombre_original}: {error_msg}")
+
+            # Registrar en memoria de errores para permitir reintento selectivo
+            st.session_state.archivos_listos[clave_error] = archivo_bytes
+            st.session_state.archivos_con_error[clave_error] = {
+                "nombre_original": nombre_original,
+                "bytes": archivo_bytes,
+            }
+
+            # Historial de errores en Google Drive
+            lista_actividad.insert(
+                0,
+                {
+                    "fecha": fecha_hora_accion,
+                    "archivo": nombre_original,
+                    "estado": "Error",
+                    "detalle": error_msg[:150],
+                },
+            )
+            log_actual["actividad_reciente"] = lista_actividad[:40]
+            guardar_log_en_drive(log_actual)
+
+        progreso.progress((index + 1) / total_docs)
+
+    status_text.text(
+        "✨ ¡Proceso finalizado! Historial de control actualizado en la nube."
+    )
+    return log_actual
+
+
 # Interfaz de usuario
 archivos_cargados = st.file_uploader(
     "Arrastra aquí los PDFs o imágenes de las pólizas:",
@@ -193,198 +407,96 @@ log_completo = cargar_log_desde_drive()
 if archivos_cargados:
     st.subheader(f"📋 Archivos listos para procesar: {len(archivos_cargados)}")
 
-    if st.button("🔄 Limpiar progreso de esta tanda"):
-        st.session_state.archivos_listos = {}
+    col_btn1, col_btn2 = st.columns(2)
+
+    with col_btn1:
+        if st.button("🔄 Limpiar progreso de esta tanda", use_container_width=True):
+            st.session_state.archivos_listos = {}
+            st.session_state.archivos_con_error = {}
+            st.rerun()
+
+    with col_btn2:
+        iniciar_lote = st.button(
+            "🚀 Iniciar Procesamiento con IA",
+            type="primary",
+            use_container_width=True,
+        )
+
+    if iniciar_lote:
+        lote_inicial = []
+        for archivo in archivos_cargados:
+            archivo.seek(0)
+            lote_inicial.append(
+                {
+                    "nombre_original": archivo.name,
+                    "bytes": archivo.read(),
+                }
+            )
+        log_completo = procesar_lote_documentos(
+            lote_inicial, es_reintento=False
+        )
+
+# ⚠️ PANEL DE REINTENTO EXCLUSIVO PARA ARCHIVOS CON [ERROR]
+if st.session_state.archivos_con_error:
+    cantidad_errores = len(st.session_state.archivos_con_error)
+    st.markdown("---")
+    st.warning(
+        f"⚠️ Hay **{cantidad_errores} archivo(s)** que no pudieron completarse por tiempo de espera o cuota:"
+    )
+
+    for item_err in st.session_state.archivos_con_error.values():
+        st.caption(f"• `{item_err['nombre_original']}`")
+
+    if st.button(
+        f"🔁 Reintentar únicamente los {cantidad_errores} archivo(s) con [ERROR]",
+        type="primary",
+        use_container_width=True,
+    ):
+        lote_reintento = list(st.session_state.archivos_con_error.values())
+        log_completo = procesar_lote_documentos(
+            lote_reintento, es_reintento=True
+        )
+        time.sleep(1)
         st.rerun()
 
-    if st.button("🚀 Iniciar Procesamiento con IA", type="primary"):
-        progreso = st.progress(0)
-        status_text = st.empty()
-
-        status_text.text(
-            "🔄 Sincronizando historial de seguridad desde Drive..."
-        )
-        log_completo = cargar_log_desde_drive()
-
-        dicc_procesados = log_completo["procesados"]
-        lista_actividad = log_completo["actividad_reciente"]
-
-        for index, archivo in enumerate(archivos_cargados):
-            nombre_original = archivo.name
-            extension = os.path.splitext(nombre_original)[1].lower()
-            fecha_hora_accion = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-
-            try:
-                archivo_bytes = archivo.read()
-                hash_archivo = hashlib.sha256(archivo_bytes).hexdigest()
-
-                # Validar si ya se procesó en el pasado
-                if hash_archivo in dicc_procesados:
-                    registro = dicc_procesados[hash_archivo]
-                    st.info(
-                        f"ℹ️ Omitiendo IA para '{nombre_original}'. Recuperado del registro histórico."
-                    )
-                    st.session_state.archivos_listos[
-                        registro["nombre_nuevo"]
-                    ] = archivo_bytes
-                    progreso.progress((index + 1) / len(archivos_cargados))
-                    continue
-
-                mime_type = (
-                    "application/pdf"
-                    if extension == ".pdf"
-                    else "image/jpeg"
-                )
-
-                prompt = (
-                    "Analiza minuciosamente el documento de seguro y extrae los datos requeridos.\n"
-                    "- Si el asegurado es una PERSONA JURÍDICA / EMPRESA (ej. 'FARMACIA PUJOLS SRL'), coloca la razón social completa en 'nombres' y deja 'apellidos' como cadena vacía ('').\n"
-                    "- Extrae el concepto/tipo de movimiento (ej. 'Factura Ajuste', 'Renovación', 'Inclusión', 'Póliza Nueva', 'Incendio y Líneas Aliadas').\n"
-                    "- Extrae el número de póliza exacto.\n"
-                    "- VIGENCIAS: Extrae la vigencia del movimiento o factura actual (ej. '13/05/2026' a '31/05/2026'). No utilices vigencias anuales históricas de páginas secundarias si difieren de la principal.\n"
-                    "- Si algún dato no se encuentra en el documento, devuelve una cadena vacía ('') en ese campo, pero NUNCA omitas las claves del JSON."
-                )
-
-                # Control de reintentos con pausa progresiva
-                intentos_maximos = 3
-                respuesta = None
-
-                for intento in range(intentos_maximos):
-                    try:
-                        status_text.text(
-                            f"Analizando póliza ({index + 1}/{len(archivos_cargados)}): {nombre_original} [Intento {intento + 1}]"
-                        )
-
-                        respuesta = model.generate_content(
-                            [
-                                {"mime_type": mime_type, "data": archivo_bytes},
-                                prompt,
-                            ],
-                            request_options={"timeout": 60.0},
-                        )
-                        if respuesta and respuesta.text:
-                            break
-                    except Exception as e_ia:
-                        if intento < intentos_maximos - 1:
-                            espera = (intento + 1) * 3
-                            st.warning(
-                                f"⚠️ Reintento {intento + 1} para '{nombre_original}' tras pausa de {espera}s por respuesta tardía o cuota de API..."
-                            )
-                            time.sleep(espera)
-                        else:
-                            raise e_ia
-
-                # Parseo seguro con valores por defecto
-                datos = json.loads(respuesta.text)
-                nombres = str(datos.get("nombres", "") or "").strip()
-                apellidos = str(datos.get("apellidos", "") or "").strip()
-                concepto = str(datos.get("concepto", "") or "").strip()
-                numero_poliza = str(datos.get("numero_poliza", "") or "").strip()
-                fecha_inicio = str(datos.get("fecha_inicio", "") or "").strip()
-                fecha_fin = str(datos.get("fecha_fin", "") or "").strip()
-
-                if (
-                    "especificado" in nombres.lower()
-                    or "especificado" in numero_poliza.lower()
-                    or (not nombres and not apellidos)
-                ):
-                    nuevo_nombre = f"[MANUAL] - {nombre_original}".upper()
-                else:
-                    f_inicio = corregir_formato_fecha(fecha_inicio)
-                    f_fin = corregir_formato_fecha(fecha_fin)
-                    tipo_doc = concepto if concepto else "DOCUMENTO"
-                    nombre_completo = f"{nombres} {apellidos}".strip()
-
-                    cadena_nombre = f"{nombre_completo} - PÓLIZA - {tipo_doc} - {numero_poliza} - vigencia {f_inicio} al {f_fin}{extension}"
-                    nuevo_nombre = re.sub(r"\s+", " ", cadena_nombre).upper()
-
-                st.session_state.archivos_listos[nuevo_nombre] = archivo_bytes
-
-                # Registrar éxito
-                dicc_procesados[hash_archivo] = {
-                    "nombre_original": nombre_original,
-                    "nombre_nuevo": nuevo_nombre,
-                    "fecha_revision": fecha_hora_accion.split()[0],
-                }
-
-                lista_actividad.insert(
-                    0,
-                    {
-                        "fecha": fecha_hora_accion,
-                        "archivo": nombre_original,
-                        "estado": "Éxito",
-                        "detalle": f"Organizado como: {nuevo_nombre}",
-                    },
-                )
-
-                log_completo["actividad_reciente"] = lista_actividad[:40]
-                guardar_log_en_drive(log_completo)
-
-                st.success(f"✅ Sincronizado correctamente: {nuevo_nombre}")
-
-            except Exception as e:
-                error_msg = str(e)
-                st.error(f"❌ Error en {nombre_original}: {error_msg}")
-                st.session_state.archivos_listos[
-                    f"[ERROR] - {nombre_original}".upper()
-                ] = archivo_bytes
-
-                # Historial de errores
-                lista_actividad.insert(
-                    0,
-                    {
-                        "fecha": fecha_hora_accion,
-                        "archivo": nombre_original,
-                        "estado": "Error",
-                        "detalle": error_msg[:150],
-                    },
-                )
-                log_completo["actividad_reciente"] = lista_actividad[:40]
-                guardar_log_en_drive(log_completo)
-
-            progreso.progress((index + 1) / len(archivos_cargados))
-
-        status_text.text(
-            "✨ ¡Lote finalizado! Historial de control actualizado en la nube."
-        )
-
 # SECCIÓN DE DESCARGAS
+archivos_exitosos = {
+    k: v
+    for k, v in st.session_state.archivos_listos.items()
+    if not k.startswith("[ERROR]")
+}
+
 if st.session_state.archivos_listos:
     st.markdown("---")
     st.subheader(
-        f"📦 Resultados listos ({len(st.session_state.archivos_listos)} archivos)"
+        f"📦 Resultados listos ({len(archivos_exitosos)} exitosos de {len(st.session_state.archivos_listos)} procesados)"
     )
 
-    # 1. Botón unificado en ZIP
-    zip_buffer = io.BytesIO()
-    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
-        for (
-            nombre_archivo,
-            contenido_bytes,
-        ) in st.session_state.archivos_listos.items():
-            if not nombre_archivo.startswith("[ERROR]"):
+    if archivos_exitosos:
+        # 1. Botón unificado en ZIP
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+            for nombre_archivo, contenido_bytes in archivos_exitosos.items():
                 zip_file.writestr(nombre_archivo, contenido_bytes)
 
-    st.download_button(
-        label="💾 Descargar TODO el Lote Organizado (.ZIP)",
-        data=zip_buffer.getvalue(),
-        file_name="polizas_organizadas.zip",
-        mime="application/zip",
-        use_container_width=True,
-    )
+        st.download_button(
+            label="💾 Descargar TODO el Lote Organizado (.ZIP)",
+            data=zip_buffer.getvalue(),
+            file_name="polizas_organizadas.zip",
+            mime="application/zip",
+            use_container_width=True,
+        )
 
-    st.markdown("### 📄 Descargas Individuales")
-    st.markdown(
-        "Haz clic en cualquier archivo procesado para guardarlo de nuevo con su nombre estructurado:"
-    )
+        st.markdown("### 📄 Descargas Individuales")
+        st.markdown(
+            "Haz clic en cualquier archivo procesado para guardarlo de nuevo con su nombre estructurado:"
+        )
 
-    # 2. Descargas individuales
-    for (
-        nombre_archivo,
-        contenido_bytes,
-    ) in st.session_state.archivos_listos.items():
-        if not nombre_archivo.startswith("[ERROR]"):
-            llave_boton = hashlib.md5(nombre_archivo.encode("utf-8")).hexdigest()
+        # 2. Descargas individuales
+        for nombre_archivo, contenido_bytes in archivos_exitosos.items():
+            llave_boton = hashlib.md5(
+                nombre_archivo.encode("utf-8")
+            ).hexdigest()
 
             st.download_button(
                 label=f"⬇️ Descargar: {nombre_archivo}",
