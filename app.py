@@ -21,7 +21,7 @@ st.set_page_config(
 
 st.title("🌐 Extractor de Seguros - Nube Sincronizada")
 st.markdown(
-    "Procesamiento de pólizas con protección de consumo y registro de actividad en Google Drive."
+    "Procesamiento de pólizas con protección de consumo, edición en pantalla y registro en Google Drive."
 )
 
 # 1. CONFIGURACIÓN DE SEGURIDAD Y LLAVES
@@ -33,12 +33,15 @@ else:
     )
     st.stop()
 
-# Inicializar memoria de la sesión actual
+# Inicializar memorias de la sesión actual
 if "archivos_listos" not in st.session_state:
     st.session_state.archivos_listos = {}
 
 if "archivos_con_error" not in st.session_state:
     st.session_state.archivos_con_error = {}
+
+if "metadatos_lote" not in st.session_state:
+    st.session_state.metadatos_lote = {}
 
 # ID DIRECTO DEL ARCHIVO EN DRIVE (registro_procesados)
 FILE_ID = "1qC9450pvpyFgTOc6uyDegSmdVjWmT4qM"
@@ -189,7 +192,7 @@ modelo_respaldo = genai.GenerativeModel(
 def corregir_formato_fecha(fecha_str):
     if not fecha_str or "especificado" in str(fecha_str).lower():
         return fecha_str
-    limpia = re.sub(r"[-/.\s]", "-", str(fecha_str))
+    limpia = re.sub(r"[-/.\s]", "-", str(fecha_str).strip())
     partes = limpia.split("-")
     if len(partes) >= 3:
         dia = partes[0].strip().zfill(2)
@@ -199,6 +202,50 @@ def corregir_formato_fecha(fecha_str):
             anio = "20" + anio
         return f"{dia}-{mes}-{anio}"
     return fecha_str
+
+
+# Construir nombre estandarizado en mayúsculas
+def construir_nombre_estandar(
+    cliente, concepto, numero_poliza, fecha_inicio, fecha_fin, extension
+):
+    f_inicio = corregir_formato_fecha(fecha_inicio)
+    f_fin = corregir_formato_fecha(fecha_fin)
+    tipo_doc = concepto.strip() if concepto.strip() else "DOCUMENTO"
+    cliente_limpio = cliente.strip()
+    poliza_limpia = numero_poliza.strip()
+
+    cadena_nombre = (
+        f"{cliente_limpio} - PÓLIZA - {tipo_doc} - {poliza_limpia} "
+        f"- VIGENCIA {f_inicio} AL {f_fin}{extension}"
+    )
+    return re.sub(r"\s+", " ", cadena_nombre).upper()
+
+
+# Extraer campos de un nombre ya formateado (para edición de archivos recuperados de Drive)
+def desglosar_nombre_estructurado(nombre_estructurado, extension):
+    base = nombre_estructurado
+    if base.lower().endswith(extension.lower()):
+        base = base[: -len(extension)]
+
+    patron = (
+        r"^(.*?)\s*-\s*PÓLIZA\s*-\s*(.*?)\s*-\s*(.*?)\s*-\s*VIGENCIA\s*(.*?)\s*AL\s*(.*)\$"
+    )
+    coincidencia = re.match(patron, base, re.IGNORECASE)
+    if coincidencia:
+        return {
+            "cliente": coincidencia.group(1).strip(),
+            "concepto": coincidencia.group(2).strip(),
+            "numero_poliza": coincidencia.group(3).strip(),
+            "fecha_inicio": coincidencia.group(4).strip(),
+            "fecha_fin": coincidencia.group(5).strip(),
+        }
+    return {
+        "cliente": "",
+        "concepto": "",
+        "numero_poliza": "",
+        "fecha_inicio": "",
+        "fecha_fin": "",
+    }
 
 
 # Limpieza preventiva de bloques Markdown en respuestas JSON
@@ -244,15 +291,33 @@ def procesar_lote_documentos(lista_documentos, es_reintento=False):
             # Validar si ya se procesó en el pasado
             if hash_archivo in dicc_procesados:
                 registro = dicc_procesados[hash_archivo]
+                nombre_recuperado = registro["nombre_nuevo"]
                 st.info(
                     f"ℹ️ Omitiendo IA para '{nombre_original}'. Recuperado del registro histórico."
                 )
-                st.session_state.archivos_listos[registro["nombre_nuevo"]] = (
+                st.session_state.archivos_listos[nombre_recuperado] = (
                     archivo_bytes
                 )
-                # Limpiar rastro de error si venía de un reintento
                 st.session_state.archivos_listos.pop(clave_error, None)
                 st.session_state.archivos_con_error.pop(clave_error, None)
+
+                campos_previos = desglosar_nombre_estructurado(
+                    nombre_recuperado, extension
+                )
+                st.session_state.metadatos_lote[hash_archivo] = {
+                    "hash": hash_archivo,
+                    "nombre_original": nombre_original,
+                    "nombre_actual": nombre_recuperado,
+                    "extension": extension,
+                    "bytes": archivo_bytes,
+                    "es_manual": nombre_recuperado.startswith("[MANUAL]"),
+                    "cliente": campos_previos["cliente"],
+                    "concepto": campos_previos["concepto"],
+                    "numero_poliza": campos_previos["numero_poliza"],
+                    "fecha_inicio": campos_previos["fecha_inicio"],
+                    "fecha_fin": campos_previos["fecha_fin"],
+                }
+
                 progreso.progress((index + 1) / total_docs)
                 continue
 
@@ -281,7 +346,9 @@ def procesar_lote_documentos(lista_documentos, es_reintento=False):
                     )
                     timeout_actual = 120.0 if intento == 0 else 180.0
 
-                    etiqueta_modo = "Reintentando" if es_reintento else "Analizando"
+                    etiqueta_modo = (
+                        "Reintentando" if es_reintento else "Analizando"
+                    )
                     status_text.text(
                         f"{etiqueta_modo} póliza ({index + 1}/{total_docs}): "
                         f"{nombre_original} [Intento {intento + 1} - {nombre_modelo}]"
@@ -317,27 +384,46 @@ def procesar_lote_documentos(lista_documentos, es_reintento=False):
             fecha_inicio = str(datos.get("fecha_inicio", "") or "").strip()
             fecha_fin = str(datos.get("fecha_fin", "") or "").strip()
 
-            if (
+            nombre_completo = f"{nombres} {apellidos}".strip()
+            es_manual = (
                 "especificado" in nombres.lower()
                 or "especificado" in numero_poliza.lower()
                 or (not nombres and not apellidos)
-            ):
+            )
+
+            if es_manual:
                 nuevo_nombre = f"[MANUAL] - {nombre_original}".upper()
             else:
-                f_inicio = corregir_formato_fecha(fecha_inicio)
-                f_fin = corregir_formato_fecha(fecha_fin)
-                tipo_doc = concepto if concepto else "DOCUMENTO"
-                nombre_completo = f"{nombres} {apellidos}".strip()
+                nuevo_nombre = construir_nombre_estandar(
+                    cliente=nombre_completo,
+                    concepto=concepto,
+                    numero_poliza=numero_poliza,
+                    fecha_inicio=fecha_inicio,
+                    fecha_fin=fecha_fin,
+                    extension=extension,
+                )
 
-                cadena_nombre = f"{nombre_completo} - PÓLIZA - {tipo_doc} - {numero_poliza} - vigencia {f_inicio} al {f_fin}{extension}"
-                nuevo_nombre = re.sub(r"\s+", " ", cadena_nombre).upper()
-
-            # Guardar resultado exitoso y eliminar cualquier marca de error previa
+            # Guardar resultado exitoso y limpiar marcas de error previas
             st.session_state.archivos_listos.pop(clave_error, None)
             st.session_state.archivos_con_error.pop(clave_error, None)
             st.session_state.archivos_listos[nuevo_nombre] = archivo_bytes
 
-            # Registrar éxito en Google Drive
+            # Guardar metadatos estructurados para permitir edición manual en pantalla
+            st.session_state.metadatos_lote[hash_archivo] = {
+                "hash": hash_archivo,
+                "nombre_original": nombre_original,
+                "nombre_actual": nuevo_nombre,
+                "extension": extension,
+                "bytes": archivo_bytes,
+                "es_manual": es_manual,
+                "cliente": nombre_completo.upper(),
+                "concepto": (concepto if concepto else "DOCUMENTO").upper(),
+                "numero_poliza": numero_poliza.upper(),
+                "fecha_inicio": corregir_formato_fecha(fecha_inicio),
+                "fecha_fin": corregir_formato_fecha(fecha_fin),
+            }
+
+            # Registrar en Google Drive
             dicc_procesados[hash_archivo] = {
                 "nombre_original": nombre_original,
                 "nombre_nuevo": nuevo_nombre,
@@ -357,7 +443,12 @@ def procesar_lote_documentos(lista_documentos, es_reintento=False):
             log_actual["actividad_reciente"] = lista_actividad[:40]
             guardar_log_en_drive(log_actual)
 
-            st.success(f"✅ Sincronizado correctamente: {nuevo_nombre}")
+            if es_manual:
+                st.warning(
+                    f"⚠️ Requiere revisión manual en pantalla: {nuevo_nombre}"
+                )
+            else:
+                st.success(f"✅ Sincronizado correctamente: {nuevo_nombre}")
 
             if index < total_docs - 1:
                 time.sleep(1)
@@ -410,9 +501,12 @@ if archivos_cargados:
     col_btn1, col_btn2 = st.columns(2)
 
     with col_btn1:
-        if st.button("🔄 Limpiar progreso de esta tanda", use_container_width=True):
+        if st.button(
+            "🔄 Limpiar progreso de esta tanda", use_container_width=True
+        ):
             st.session_state.archivos_listos = {}
             st.session_state.archivos_con_error = {}
+            st.session_state.metadatos_lote = {}
             st.rerun()
 
     with col_btn2:
@@ -459,6 +553,164 @@ if st.session_state.archivos_con_error:
         time.sleep(1)
         st.rerun()
 
+# ✏️ PANEL DE EDICIÓN MANUAL EN PANTALLA ([MANUAL] Y CORRECCIÓN GENERAL)
+if st.session_state.metadatos_lote:
+    st.markdown("---")
+
+    # Ordenar poniendo primero los archivos que quedaron marcados como [MANUAL]
+    lista_meta = sorted(
+        st.session_state.metadatos_lote.values(),
+        key=lambda x: (not x["es_manual"], x["nombre_original"]),
+    )
+    cantidad_manuales = sum(1 for m in lista_meta if m["es_manual"])
+
+    titulo_expander = (
+        f"✏️ Editor Manual de Nombres ({cantidad_manuales} pendiente(s) de revisión [MANUAL])"
+        if cantidad_manuales > 0
+        else "✏️ Editor Manual de Nombres (Ajustar o corregir cualquier póliza antes de descargar)"
+    )
+
+    with st.expander(titulo_expander, expanded=(cantidad_manuales > 0)):
+        st.markdown(
+            "Selecciona un documento para completar sus datos o corregir su nombre. "
+            "Al guardar, se actualizará tanto el archivo en el **.ZIP** como la base de datos en **Google Drive**."
+        )
+
+        opciones_selector = {
+            f"{'⚠️ [MANUAL] ' if m['es_manual'] else '✅ '}{m['nombre_original']} ➔ {m['nombre_actual']}": m[
+                "hash"
+            ]
+            for m in lista_meta
+        }
+
+        etiqueta_seleccionada = st.selectbox(
+            "Archivo a editar:",
+            options=list(opciones_selector.keys()),
+        )
+        hash_seleccionado = opciones_selector[etiqueta_seleccionada]
+        meta_actual = st.session_state.metadatos_lote[hash_seleccionado]
+
+        # Botón auxiliar para descargar el PDF original si necesitas consultarlo visualmente
+        st.download_button(
+            label=f"👁️ Abrir documento original ({meta_actual['nombre_original']}) para verificar datos",
+            data=meta_actual["bytes"],
+            file_name=meta_actual["nombre_original"],
+            mime="application/octet-stream",
+            key=f"ver_orig_{hash_seleccionado}",
+        )
+
+        with st.form(key=f"form_edicion_{hash_seleccionado}"):
+            col_f1, col_f2 = st.columns(2)
+            with col_f1:
+                input_cliente = st.text_input(
+                    "Cliente o Razón Social:",
+                    value=meta_actual["cliente"],
+                    placeholder="Ej. FARMACIA PUJOLS SRL",
+                )
+                input_poliza = st.text_input(
+                    "Número de Póliza:",
+                    value=meta_actual["numero_poliza"],
+                    placeholder="Ej. 01-0023456-0",
+                )
+                input_f_inicio = st.text_input(
+                    "Vigencia Desde (DD-MM-AAAA):",
+                    value=meta_actual["fecha_inicio"],
+                    placeholder="Ej. 13-05-2026",
+                )
+
+            with col_f2:
+                input_concepto = st.text_input(
+                    "Concepto / Movimiento:",
+                    value=meta_actual["concepto"],
+                    placeholder="Ej. RENOVACIÓN / FACTURA AJUSTE",
+                )
+                st.text_input(
+                    "Extensión del archivo:",
+                    value=meta_actual["extension"].upper(),
+                    disabled=True,
+                )
+                input_f_fin = st.text_input(
+                    "Vigencia Hasta (DD-MM-AAAA):",
+                    value=meta_actual["fecha_fin"],
+                    placeholder="Ej. 31-05-2026",
+                )
+
+            guardar_edicion = st.form_submit_button(
+                "💾 Guardar cambios y sincronizar con Google Drive",
+                type="primary",
+                use_container_width=True,
+            )
+
+            if guardar_edicion:
+                if not input_cliente.strip() or not input_poliza.strip():
+                    st.error(
+                        "⚠️ Debes completar al menos el Cliente/Razón Social y el Número de Póliza."
+                    )
+                else:
+                    nuevo_nombre_editado = construir_nombre_estandar(
+                        cliente=input_cliente,
+                        concepto=input_concepto,
+                        numero_poliza=input_poliza,
+                        fecha_inicio=input_f_inicio,
+                        fecha_fin=input_f_fin,
+                        extension=meta_actual["extension"],
+                    )
+
+                    nombre_anterior = meta_actual["nombre_actual"]
+                    fecha_hora_edicion = datetime.now().strftime(
+                        "%d/%m/%Y %H:%M:%S"
+                    )
+
+                    # 1. Reemplazar en la lista de descargas de la sesión
+                    st.session_state.archivos_listos.pop(nombre_anterior, None)
+                    st.session_state.archivos_listos[nuevo_nombre_editado] = (
+                        meta_actual["bytes"]
+                    )
+
+                    # 2. Actualizar metadatos en memoria
+                    meta_actual["nombre_actual"] = nuevo_nombre_editado
+                    meta_actual["es_manual"] = False
+                    meta_actual["cliente"] = input_cliente.strip().upper()
+                    meta_actual["concepto"] = (
+                        input_concepto.strip().upper()
+                        if input_concepto.strip()
+                        else "DOCUMENTO"
+                    )
+                    meta_actual["numero_poliza"] = input_poliza.strip().upper()
+                    meta_actual["fecha_inicio"] = corregir_formato_fecha(
+                        input_f_inicio
+                    )
+                    meta_actual["fecha_fin"] = corregir_formato_fecha(
+                        input_f_fin
+                    )
+
+                    # 3. Sincronizar cambio con el archivo JSON en Google Drive
+                    log_edicion = cargar_log_desde_drive()
+                    log_edicion["procesados"][hash_seleccionado] = {
+                        "nombre_original": meta_actual["nombre_original"],
+                        "nombre_nuevo": nuevo_nombre_editado,
+                        "fecha_revision": fecha_hora_edicion.split()[0],
+                    }
+                    log_edicion["actividad_reciente"].insert(
+                        0,
+                        {
+                            "fecha": fecha_hora_edicion,
+                            "archivo": meta_actual["nombre_original"],
+                            "estado": "Éxito",
+                            "detalle": f"Editado manualmente: {nuevo_nombre_editado}",
+                        },
+                    )
+                    log_edicion["actividad_reciente"] = log_edicion[
+                        "actividad_reciente"
+                    ][:40]
+                    guardar_log_en_drive(log_edicion)
+
+                    st.success(
+                        f"✅ Nombre actualizado a: {nuevo_nombre_editado}"
+                    )
+                    time.sleep(0.8)
+                    st.rerun()
+
 # SECCIÓN DE DESCARGAS
 archivos_exitosos = {
     k: v
@@ -469,7 +721,7 @@ archivos_exitosos = {
 if st.session_state.archivos_listos:
     st.markdown("---")
     st.subheader(
-        f"📦 Resultados listos ({len(archivos_exitosos)} exitosos de {len(st.session_state.archivos_listos)} procesados)"
+        f"📦 Resultados listos ({len(archivos_exitosos)} disponibles de {len(st.session_state.archivos_listos)} procesados)"
     )
 
     if archivos_exitosos:
